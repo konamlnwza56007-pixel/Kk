@@ -1,0 +1,4177 @@
+--[[
+	NOVA // SINGLE-FILE COMMAND CENTER
+	Place in: StarterPlayer > StarterPlayerScripts > LocalScript
+
+	No require()
+	No external assets
+	No executor APIs
+	No loadstring()
+
+	Shortcuts:
+		Ctrl + K   Command Palette
+		RightShift Toggle UI
+		F6         Execute Local Demo
+
+	Library and demo are included in this file.
+]]
+
+---------------------------------------------------------------------
+-- SERVICES
+---------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local StatsService = game:GetService("Stats")
+
+local Player = Players.LocalPlayer
+assert(Player, "NOVA must run from a LocalScript on the client.")
+
+local PlayerGui = Player:WaitForChild("PlayerGui")
+
+---------------------------------------------------------------------
+-- CLEANUP SCOPE
+---------------------------------------------------------------------
+
+local Scope = {}
+Scope.__index = Scope
+
+function Scope.new(parent)
+	local self = setmetatable({
+		Alive = true,
+		Items = {},
+		Next = 0,
+		Parent = parent,
+	}, Scope)
+
+	if parent then
+		self.ParentKey = parent:Add(function()
+			self:Destroy()
+		end)
+	end
+
+	return self
+end
+
+function Scope:Add(item)
+	local kind = typeof(item)
+	local dispose
+
+	if kind == "RBXScriptConnection" then
+		dispose = function()
+			item:Disconnect()
+		end
+	elseif kind == "Instance" then
+		dispose = function()
+			item:Destroy()
+		end
+	elseif type(item) == "function" then
+		dispose = item
+	else
+		error("Unsupported cleanup item")
+	end
+
+	if not self.Alive then
+		pcall(dispose)
+		return 0
+	end
+
+	self.Next += 1
+	self.Items[self.Next] = dispose
+	return self.Next
+end
+
+function Scope:Remove(key)
+	local dispose = self.Items[key]
+	self.Items[key] = nil
+
+	if dispose then
+		local ok, err = pcall(dispose)
+		if not ok then
+			warn("[NOVA cleanup]", err)
+		end
+	end
+end
+
+function Scope:Child()
+	return Scope.new(self)
+end
+
+function Scope:Destroy()
+	if not self.Alive then
+		return
+	end
+
+	self.Alive = false
+
+	if self.Parent and self.ParentKey then
+		self.Parent.Items[self.ParentKey] = nil
+	end
+
+	self.Parent = nil
+
+	local keys = {}
+	for key in self.Items do
+		table.insert(keys, key)
+	end
+
+	table.sort(keys, function(a, b)
+		return a > b
+	end)
+
+	for _, key in keys do
+		self:Remove(key)
+	end
+end
+
+---------------------------------------------------------------------
+-- THEMES
+---------------------------------------------------------------------
+
+local function C(hex)
+	return Color3.fromHex(hex)
+end
+
+local function palette(bg, panel, panel2, accent, secondary, text, muted)
+	return {
+		Background = C(bg),
+		Panel = C(panel),
+		Panel2 = C(panel2),
+		Accent = C(accent),
+		Secondary = C(secondary),
+		Text = C(text),
+		Muted = C(muted),
+		Glow = C(accent),
+		Particle = C(secondary),
+		Border = C(accent):Lerp(C(bg), 0.5),
+
+		System = C("53E8FF"),
+		Success = C("68FBB2"),
+		Warning = C("FFD66E"),
+		Error = C("FF557B"),
+		Executor = C("B179FF"),
+		Console = C("66B8FF"),
+		Settings = C("FF7CCE"),
+	}
+end
+
+local Themes = {
+	NeonPurple = palette(
+		"080A17", "141329", "201A3B",
+		"A774FF", "48DFFF", "F1F0FF", "929DBD"
+	),
+	CyberBlue = palette(
+		"040D19", "0B1C30", "0D2A40",
+		"438AFF", "42F2FF", "EAF8FF", "85A6C6"
+	),
+	BloodMoon = palette(
+		"13070D", "25101A", "3A1624",
+		"FF426B", "FF946C", "FFF0F3", "BD8B9B"
+	),
+	Toxic = palette(
+		"07110B", "102119", "1C3020",
+		"ACFF42", "37E9A6", "F2FFE8", "91B49A"
+	),
+	Void = palette(
+		"05050C", "10101D", "1A1530",
+		"865CFF", "DD6CFF", "ECE7FF", "8D88AD"
+	),
+	Amethyst = palette(
+		"10091B", "221232", "371845",
+		"C887FF", "FF70D8", "FCEDFF", "B395C5"
+	),
+	Arctic = palette(
+		"DCE9F4", "F3F9FF", "D6E8F5",
+		"3966DA", "008AA5", "142744", "526D88"
+	),
+}
+
+local ThemeNames = {
+	"NeonPurple",
+	"CyberBlue",
+	"BloodMoon",
+	"Toxic",
+	"Void",
+	"Amethyst",
+	"Arctic",
+}
+
+---------------------------------------------------------------------
+-- LIBRARY / RUNTIME
+---------------------------------------------------------------------
+
+local Library = {
+	Scope = Scope.new(),
+	Options = {
+		Animated = true,
+		Effects = true,
+		Particles = true,
+		Glow = true,
+		ReducedMotion = false,
+		PerformanceMode = false,
+		TerminalTyping = true,
+		UIScale = 1,
+		Transparency = 0.05,
+		MaxParticles = 36,
+		ParticleLifetime = 12,
+		ParticleSpeed = 0.035,
+		ParticleOpacity = 0.55,
+	},
+	ThemeName = "NeonPurple",
+	Palette = table.clone(Themes.NeonPurple),
+	Jobs = {},
+	Bindings = {},
+	Watchers = {},
+	Registry = {},
+	Keybinds = {},
+	TweenSlots = setmetatable({}, {__mode = "k"}),
+	Time = 0,
+	FPS = 60,
+}
+
+local function finite(n)
+	return type(n) == "number"
+		and n == n
+		and n > -math.huge
+		and n < math.huge
+end
+
+function Library:Call(callback, ...)
+	if not callback then
+		return
+	end
+
+	local args = table.pack(...)
+	local ok, err = xpcall(function()
+		callback(table.unpack(args, 1, args.n))
+	end, debug.traceback)
+
+	if not ok then
+		warn("[NOVA callback]", err)
+	end
+end
+
+function Library:Motion()
+	return self.Options.Animated
+		and not self.Options.ReducedMotion
+		and not self.Options.PerformanceMode
+end
+
+function Library:Job(scope, callback)
+	local token = {}
+	local key = scope:Add(function()
+		self.Jobs[token] = nil
+	end)
+
+	if scope.Alive then
+		self.Jobs[token] = {
+			Scope = scope,
+			Callback = callback,
+			Key = key,
+		}
+	end
+
+	return function()
+		scope:Remove(key)
+	end
+end
+
+function Library:After(seconds, callback, owner)
+	local scope = owner or self.Scope
+	local deadline = self.Time + math.max(0, seconds)
+	local cancel
+
+	cancel = self:Job(scope, function()
+		if self.Time >= deadline then
+			cancel()
+
+			if scope.Alive then
+				self:Call(callback)
+			end
+		end
+	end)
+
+	return cancel
+end
+
+function Library:Tween(scope, object, duration, properties, channel)
+	if not scope.Alive then
+		return
+	end
+
+	channel = channel or "main"
+
+	local slots = self.TweenSlots[object]
+	if not slots then
+		slots = {}
+		self.TweenSlots[object] = slots
+	end
+
+	if slots[channel] then
+		slots[channel]()
+	end
+
+	if not self:Motion() then
+		for property, value in properties do
+			object[property] = value
+		end
+		return
+	end
+
+	local tween = TweenService:Create(
+		object,
+		TweenInfo.new(
+			duration,
+			Enum.EasingStyle.Quart,
+			Enum.EasingDirection.Out
+		),
+		properties
+	)
+
+	local connection
+	local key
+	local cancel
+
+	cancel = function()
+		scope:Remove(key)
+	end
+
+	key = scope:Add(function()
+		if connection then
+			connection:Disconnect()
+		end
+
+		tween:Cancel()
+		tween:Destroy()
+
+		if slots[channel] == cancel then
+			slots[channel] = nil
+		end
+	end)
+
+	slots[channel] = cancel
+
+	connection = tween.Completed:Connect(function()
+		scope:Remove(key)
+	end)
+
+	tween:Play()
+end
+
+function Library:Bind(scope, object, property, role)
+	local token = {}
+
+	local function apply()
+		if type(role) == "table" then
+			object[property] = ColorSequence.new(
+				self.Palette[role[1]],
+				self.Palette[role[2]]
+			)
+		else
+			object[property] = self.Palette[role]
+		end
+	end
+
+	self.Bindings[token] = apply
+
+	scope:Add(function()
+		self.Bindings[token] = nil
+	end)
+
+	apply()
+end
+
+function Library:Watch(scope, callback)
+	local token = {}
+	self.Watchers[token] = callback
+
+	scope:Add(function()
+		self.Watchers[token] = nil
+	end)
+
+	callback()
+end
+
+function Library:Refresh()
+	for _, apply in self.Bindings do
+		self:Call(apply)
+	end
+
+	for _, callback in self.Watchers do
+		self:Call(callback)
+	end
+end
+
+function Library:SetTheme(name)
+	assert(Themes[name], "Unknown theme: " .. tostring(name))
+
+	self.ThemeName = name
+	self.Palette = table.clone(Themes[name])
+
+	if self.Options.Accent then
+		self.Palette.Accent = self.Options.Accent
+		self.Palette.Glow = self.Options.Accent
+	end
+
+	self:Refresh()
+end
+
+function Library:SetOption(name, value)
+	if name == "Accent" then
+		assert(typeof(value) == "Color3", "Accent expects Color3")
+	elseif name == "UIScale" then
+		assert(finite(value), "Invalid UI scale")
+		value = math.clamp(value, 0.75, 1.5)
+	elseif name == "Transparency" then
+		assert(finite(value), "Invalid transparency")
+		value = math.clamp(value, 0, 0.65)
+	elseif name == "MaxParticles" then
+		assert(finite(value), "Invalid particle count")
+		value = math.clamp(math.floor(value), 0, 72)
+	else
+		assert(
+			type(self.Options[name]) == "boolean"
+				and type(value) == "boolean",
+			"Invalid option: " .. tostring(name)
+		)
+	end
+
+	self.Options[name] = value
+
+	if name == "Accent" then
+		self:SetTheme(self.ThemeName)
+	else
+		self:Refresh()
+	end
+end
+
+function Library:SetPerformanceMode(enabled)
+	self:SetOption("PerformanceMode", enabled)
+end
+
+local heartbeatAccumulator = 0
+
+Library.Scope:Add(RunService.Heartbeat:Connect(function(dt)
+	Library.Time += dt
+	Library.FPS += (1 / math.max(dt, 0.001) - Library.FPS) * 0.08
+
+	heartbeatAccumulator += dt
+
+	local interval = Library.Options.PerformanceMode and 0.1 or 1 / 30
+
+	if heartbeatAccumulator < interval then
+		return
+	end
+
+	local step = heartbeatAccumulator
+	heartbeatAccumulator = 0
+
+	local snapshot = {}
+	for token, job in Library.Jobs do
+		table.insert(snapshot, {token, job})
+	end
+
+	for _, entry in snapshot do
+		local token, job = entry[1], entry[2]
+
+		if Library.Jobs[token] and job.Scope.Alive then
+			local ok, err = xpcall(function()
+				job.Callback(step, Library.Time)
+			end, debug.traceback)
+
+			if not ok then
+				warn("[NOVA scheduler]", err)
+				job.Scope:Remove(job.Key)
+			end
+		end
+	end
+end))
+
+---------------------------------------------------------------------
+-- GUI PRIMITIVES
+---------------------------------------------------------------------
+
+local UI = {}
+
+function UI.New(scope, className, parent, properties, bindings)
+	local object = Instance.new(className)
+
+	if object:IsA("GuiObject") then
+		object.BorderSizePixel = 0
+	end
+
+	if object:IsA("TextLabel")
+		or object:IsA("TextButton")
+		or object:IsA("TextBox")
+	then
+		object.Font = Enum.Font.GothamMedium
+		object.TextSize = 13
+		object.TextColor3 = Library.Palette.Text
+	end
+
+	if object:IsA("TextButton") then
+		object.AutoButtonColor = false
+	end
+
+	if object:IsA("TextBox") then
+		object.ClearTextOnFocus = false
+	end
+
+	for property, value in properties or {} do
+		object[property] = value
+	end
+
+	object.Parent = parent
+	scope:Add(object)
+
+	for property, role in bindings or {} do
+		Library:Bind(scope, object, property, role)
+	end
+
+	return object
+end
+
+function UI.Round(scope, object, radius)
+	return UI.New(scope, "UICorner", object, {
+		CornerRadius = UDim.new(0, radius or 10),
+	})
+end
+
+function UI.Stroke(scope, object, role, thickness, transparency)
+	return UI.New(scope, "UIStroke", object, {
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Thickness = thickness or 1,
+		Transparency = transparency or 0,
+	}, {
+		Color = role or "Border",
+	})
+end
+
+function UI.Gradient(scope, object, a, b, rotation)
+	return UI.New(scope, "UIGradient", object, {
+		Rotation = rotation or 25,
+	}, {
+		Color = {a or "Panel", b or "Panel2"},
+	})
+end
+
+function UI.Text(scope, parent, text, properties, role)
+	local props = {
+		BackgroundTransparency = 1,
+		Text = text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Size = UDim2.new(1, 0, 0, 20),
+	}
+
+	for property, value in properties or {} do
+		props[property] = value
+	end
+
+	return UI.New(scope, "TextLabel", parent, props, {
+		TextColor3 = role or "Text",
+	})
+end
+
+function UI.Panel(scope, parent, properties, role, className)
+	local panel = UI.New(
+		scope,
+		className or "Frame",
+		parent,
+		properties or {},
+		{BackgroundColor3 = "Panel"}
+	)
+
+	UI.Round(scope, panel, 10)
+	local stroke = UI.Stroke(scope, panel, role or "Border", 1, 0.15)
+	UI.Gradient(scope, panel, "Panel", "Panel2", 25)
+
+	Library:Watch(scope, function()
+		panel.BackgroundTransparency = Library.Options.Transparency
+	end)
+
+	return panel, stroke
+end
+
+function UI.Padding(scope, parent, amount)
+	UI.New(scope, "UIPadding", parent, {
+		PaddingLeft = UDim.new(0, amount),
+		PaddingRight = UDim.new(0, amount),
+		PaddingTop = UDim.new(0, amount),
+		PaddingBottom = UDim.new(0, amount),
+	})
+end
+
+function UI.List(scope, parent, gap)
+	return UI.New(scope, "UIListLayout", parent, {
+		Padding = UDim.new(0, gap or 10),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	})
+end
+
+function UI.Brackets(scope, parent, role)
+	for _, corner in {
+		Vector2.new(0, 0),
+		Vector2.new(1, 0),
+		Vector2.new(0, 1),
+		Vector2.new(1, 1),
+	} do
+		for _, size in {
+			Vector2.new(24, 2),
+			Vector2.new(2, 24),
+		} do
+			UI.New(scope, "Frame", parent, {
+				AnchorPoint = corner,
+				Position = UDim2.fromScale(corner.X, corner.Y),
+				Size = UDim2.fromOffset(size.X, size.Y),
+				ZIndex = 4,
+			}, {BackgroundColor3 = role or "Accent"})
+		end
+	end
+end
+
+function UI.Field(scope, parent, text, properties)
+	local props = {
+		Text = text or "",
+		Size = UDim2.new(1, 0, 0, 46),
+		BackgroundTransparency = 0.1,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}
+
+	for property, value in properties or {} do
+		props[property] = value
+	end
+
+	local field = UI.New(scope, "TextBox", parent, props, {
+		BackgroundColor3 = "Background",
+		TextColor3 = "Text",
+		PlaceholderColor3 = "Muted",
+	})
+
+	UI.Round(scope, field, 7)
+	UI.Stroke(scope, field, "Border")
+	UI.Padding(scope, field, 10)
+
+	return field
+end
+
+---------------------------------------------------------------------
+-- EFFECTS
+---------------------------------------------------------------------
+
+local Effects = {}
+Library.Effects = Effects
+
+function Effects:Play(name, target, owner, options)
+	options = options or {}
+
+	local scope = owner:Child()
+	local duration = options.Duration or 0.5
+
+	if not Library.Options.Effects or not Library:Motion() then
+		scope:Destroy()
+		return scope
+	end
+
+	if (name == "Glow" or name == "Pulse") and not Library.Options.Glow then
+		scope:Destroy()
+		return scope
+	end
+
+	if (name == "ParticleBurst" or name == "EnergyBurst")
+		and not Library.Options.Particles
+	then
+		scope:Destroy()
+		return scope
+	end
+
+	local function overlay(properties)
+		properties.ZIndex = 12
+
+		return UI.New(scope, "Frame", target, properties, {
+			BackgroundColor3 = options.Role or "Glow",
+		})
+	end
+
+	if name == "Fade" then
+		local property = target:IsA("CanvasGroup")
+			and "GroupTransparency"
+			or "BackgroundTransparency"
+
+		Library:Tween(scope, target, duration, {
+			[property] = options.Transparency or 0,
+		}, "fade")
+
+	elseif name == "Slide" then
+		local original = target.Position
+
+		target.Position = original
+			+ UDim2.fromOffset(options.X or 24, options.Y or 0)
+
+		scope:Add(function()
+			if target.Parent then
+				target.Position = original
+			end
+		end)
+
+		Library:Tween(scope, target, duration, {
+			Position = original,
+		}, "position")
+
+	elseif name == "Scale" then
+		local scale = UI.New(scope, "UIScale", target, {
+			Scale = options.From or 0.97,
+		})
+
+		Library:Tween(scope, scale, duration, {Scale = 1})
+
+	elseif name == "Glow" or name == "Pulse" then
+		local frame = overlay({
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+		})
+
+		UI.Round(scope, frame, 10)
+
+		local stroke = UI.Stroke(scope, frame, "Glow", 5, 0.2)
+
+		Library:Tween(scope, stroke, duration, {
+			Thickness = 1,
+			Transparency = 1,
+		})
+
+	elseif name == "Glitch" then
+		for index = 1, 5 do
+			local band = overlay({
+				Position = UDim2.fromScale(0, index / 6),
+				Size = UDim2.new(1, 0, 0, index % 2 == 0 and 3 or 1),
+				BackgroundTransparency = 0.4,
+			})
+
+			Library:Tween(scope, band, duration, {
+				Position = band.Position
+					+ UDim2.fromOffset(index % 2 == 0 and 30 or -30, 0),
+				BackgroundTransparency = 1,
+			})
+		end
+
+	elseif name == "ParticleBurst" or name == "EnergyBurst" then
+		local count = math.clamp(options.Count or 12, 1, 30)
+
+		for index = 1, count do
+			local angle = index / count * math.pi * 2
+
+			local particle = overlay({
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, 0.5),
+				Size = UDim2.fromOffset(5, 2),
+				Rotation = math.deg(angle),
+				BackgroundTransparency = 0.05,
+			})
+
+			Library:Tween(scope, particle, duration, {
+				Position = UDim2.new(
+					0.5, math.cos(angle) * 95,
+					0.5, math.sin(angle) * 55
+				),
+				BackgroundTransparency = 1,
+			})
+		end
+
+	elseif name == "Ripple" then
+		local circle = overlay({
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(4, 4),
+			BackgroundTransparency = 0.82,
+		})
+
+		UI.Round(scope, circle, 1000)
+
+		local size = math.min(math.max(target.AbsoluteSize.X, 70), 240)
+
+		Library:Tween(scope, circle, duration, {
+			Size = UDim2.fromOffset(size, size),
+			BackgroundTransparency = 1,
+		})
+
+	elseif name == "Scanline" then
+		local line = overlay({
+			Position = UDim2.fromScale(0, 0),
+			Size = UDim2.new(1, 0, 0, 2),
+			BackgroundTransparency = 0.25,
+		})
+
+		Library:Tween(scope, line, duration, {
+			Position = UDim2.fromScale(0, 1),
+			BackgroundTransparency = 1,
+		})
+
+	elseif name == "Shimmer" or name == "EnergySweep" then
+		local beam = overlay({
+			Position = UDim2.fromScale(-0.2, 0),
+			Size = UDim2.new(0.18, 0, 1, 0),
+			BackgroundTransparency = 0.78,
+		})
+
+		UI.New(scope, "UIGradient", beam, {
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 1),
+				NumberSequenceKeypoint.new(0.5, 0),
+				NumberSequenceKeypoint.new(1, 1),
+			}),
+		})
+
+		Library:Tween(scope, beam, duration, {
+			Position = UDim2.fromScale(1, 0),
+			BackgroundTransparency = 1,
+		})
+
+	else
+		scope:Destroy()
+		error("Unknown effect: " .. tostring(name))
+	end
+
+	Library:After(duration + 0.05, function()
+		scope:Destroy()
+	end, scope)
+
+	return scope
+end
+
+for _, effectName in {
+	"Glow", "Pulse", "Ripple", "Shimmer", "Scanline",
+	"ParticleBurst", "EnergySweep", "EnergyBurst",
+	"Glitch", "Fade", "Slide", "Scale",
+} do
+	local name = effectName
+
+	Effects[name] = function(self, target, owner, options)
+		return self:Play(name, target, owner, options)
+	end
+end
+
+function UI.Button(scope, parent, text, properties, callback, role)
+	local props = {
+		Text = "",
+		Size = UDim2.fromOffset(140, 46),
+		Active = true,
+		ClipsDescendants = true,
+	}
+
+	for property, value in properties or {} do
+		props[property] = value
+	end
+
+	local button, stroke = UI.Panel(
+		scope, parent, props, role or "Accent", "TextButton"
+	)
+
+	local label = UI.Text(scope, button, text, {
+		Size = UDim2.fromScale(1, 1),
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+
+	local scale = UI.New(scope, "UIScale", button, {Scale = 1})
+
+	scope:Add(button.MouseEnter:Connect(function()
+		if Library.Options.Effects then
+			Library:Tween(scope, scale, 0.15, {Scale = 1.025})
+			Library:Tween(scope, stroke, 0.15, {Transparency = 0})
+		end
+
+		Library:Call(Library.Options.HoverSound, button)
+	end))
+
+	scope:Add(button.MouseLeave:Connect(function()
+		Library:Tween(scope, scale, 0.15, {Scale = 1})
+		Library:Tween(scope, stroke, 0.15, {Transparency = 0.15})
+	end))
+
+	scope:Add(button.Activated:Connect(function()
+		if Library.Options.Effects and Library:Motion() then
+			scale.Scale = 0.97
+			Library:Tween(scope, scale, 0.2, {Scale = 1})
+			Effects:Ripple(button, scope)
+		end
+
+		Library:Call(callback)
+	end))
+
+	return button, label
+end
+
+---------------------------------------------------------------------
+-- ANIMATED BACKGROUND / PARTICLES
+---------------------------------------------------------------------
+
+function Effects:Background(parent, owner, requestedCount)
+	local scope = owner:Child()
+
+	local background = UI.New(scope, "Frame", parent, {
+		Size = UDim2.fromScale(1, 1),
+		ClipsDescendants = true,
+		ZIndex = 1,
+	}, {BackgroundColor3 = "Background"})
+
+	UI.Gradient(scope, background, "Background", "Panel2", 30)
+
+	local grid = UI.New(scope, "Frame", background, {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 80, 1, 80),
+		Position = UDim2.fromOffset(-40, -40),
+	})
+
+	for index = 0, 30 do
+		UI.New(scope, "Frame", grid, {
+			Position = UDim2.fromOffset(index * 48, 0),
+			Size = UDim2.new(0, 1, 1, 0),
+			BackgroundTransparency = 0.94,
+		}, {BackgroundColor3 = "Secondary"})
+	end
+
+	for index = 0, 20 do
+		UI.New(scope, "Frame", grid, {
+			Position = UDim2.fromOffset(0, index * 48),
+			Size = UDim2.new(1, 0, 0, 1),
+			BackgroundTransparency = 0.95,
+		}, {BackgroundColor3 = "Accent"})
+	end
+
+	local beams = {}
+
+	for index = 1, 3 do
+		local beam = UI.New(scope, "Frame", background, {
+			Size = UDim2.new(0, 150, 1.8, 0),
+			Rotation = 24,
+			BackgroundTransparency = 0.94,
+		}, {
+			BackgroundColor3 = index % 2 == 0 and "Accent" or "Secondary",
+		})
+
+		UI.New(scope, "UIGradient", beam, {
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 1),
+				NumberSequenceKeypoint.new(0.5, 0),
+				NumberSequenceKeypoint.new(1, 1),
+			}),
+		})
+
+		table.insert(beams, beam)
+	end
+
+	local scan = UI.New(scope, "Frame", background, {
+		Size = UDim2.new(1, 0, 0, 2),
+		BackgroundTransparency = 0.75,
+	}, {BackgroundColor3 = "System"})
+
+	local ring = UI.New(scope, "Frame", background, {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.84, 0.45),
+		Size = UDim2.fromOffset(270, 270),
+		BackgroundTransparency = 1,
+		Rotation = 45,
+	})
+
+	UI.Round(scope, ring, 80)
+	UI.Stroke(scope, ring, "Accent", 1, 0.68)
+	UI.Brackets(scope, ring, "Secondary")
+
+	local inner = UI.New(scope, "Frame", ring, {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(0.72, 0.72),
+		BackgroundTransparency = 1,
+	})
+
+	UI.Round(scope, inner, 1000)
+	UI.Stroke(scope, inner, "Secondary", 1, 0.68)
+
+	local random = Random.new(707)
+	local particles = {}
+	local capacity = math.clamp(requestedCount or 72, 0, 72)
+
+	for index = 1, capacity do
+		local kind = index % 4
+		local node
+
+		if kind == 0 or kind == 1 then
+			node = UI.Text(
+				scope,
+				background,
+				kind == 0 and string.format("0x%02X", index * 3) or "+",
+				{
+					Size = UDim2.fromOffset(38, 16),
+					TextSize = kind == 0 and 9 or 13,
+					Font = Enum.Font.Code,
+				},
+				"Particle"
+			)
+		else
+			node = UI.New(scope, "Frame", background, {
+				Size = UDim2.fromOffset(kind == 2 and 2 or 7, 2),
+				Rotation = kind == 3 and -35 or 0,
+			}, {BackgroundColor3 = "Particle"})
+		end
+
+		table.insert(particles, {
+			Node = node,
+			X = random:NextNumber(),
+			Y = random:NextNumber(),
+			Phase = random:NextNumber(),
+			Speed = random:NextNumber(0.6, 1.4),
+		})
+	end
+
+	for _, right in {false, true} do
+		local edge = UI.New(scope, "Frame", background, {
+			AnchorPoint = Vector2.new(right and 1 or 0, 0),
+			Position = UDim2.fromScale(right and 1 or 0, 0),
+			Size = UDim2.new(0.12, 0, 1, 0),
+			BackgroundTransparency = 0.4,
+		}, {BackgroundColor3 = "Background"})
+
+		UI.New(scope, "UIGradient", edge, {
+			Rotation = right and 180 or 0,
+			Transparency = NumberSequence.new(0, 1),
+		})
+	end
+
+	local clock = 0
+
+	local function draw()
+		grid.Position = UDim2.fromOffset(-48 + clock * 3 % 48, -40)
+		scan.Position = UDim2.fromScale(0, clock * 0.055 % 1)
+
+		ring.Rotation = 45 + clock * 5
+		inner.Rotation = -clock * 8
+
+		for index, beam in beams do
+			beam.Position = UDim2.fromScale(
+				(clock * 0.025 + index / 3) % 1.6 - 0.3,
+				-0.4
+			)
+		end
+
+		for _, particle in particles do
+			local age = (clock / Library.Options.ParticleLifetime + particle.Phase) % 1
+			local opacity = math.sin(age * math.pi) * Library.Options.ParticleOpacity
+
+			particle.Node.Position = UDim2.fromScale(
+				(particle.X + math.sin(clock * 0.2 + particle.Phase) * 0.018) % 1,
+				(particle.Y - clock * Library.Options.ParticleSpeed * particle.Speed) % 1
+			)
+
+			if particle.Node:IsA("TextLabel") then
+				particle.Node.TextTransparency = 1 - opacity
+			else
+				particle.Node.BackgroundTransparency = 1 - opacity
+			end
+		end
+	end
+
+	Library:Watch(scope, function()
+		local rich = Library.Options.Effects
+			and not Library.Options.PerformanceMode
+
+		grid.Visible = rich
+		scan.Visible = rich
+		ring.Visible = rich and Library.Options.Glow
+
+		for _, beam in beams do
+			beam.Visible = rich and Library.Options.Glow
+		end
+
+		for index, particle in particles do
+			particle.Node.Visible = rich
+				and Library.Options.Particles
+				and index <= Library.Options.MaxParticles
+		end
+	end)
+
+	draw()
+
+	Library:Job(scope, function(dt)
+		if not Library:Motion() or not Library.Options.Effects then
+			return
+		end
+
+		if Library.Window and not Library.Window.Shell.Visible then
+			return
+		end
+
+		local ancestor = parent
+		while ancestor and ancestor:IsA("GuiObject") do
+			if not ancestor.Visible then
+				return
+			end
+			ancestor = ancestor.Parent
+		end
+
+		clock += dt
+		draw()
+	end)
+
+	return scope
+end
+
+---------------------------------------------------------------------
+-- SHARED INPUT ROUTER
+---------------------------------------------------------------------
+
+function Library:StopDrag()
+	local drag = self.Drag
+	self.Drag = nil
+
+	if drag and drag.Scroll and drag.Scroll.Parent then
+		drag.Scroll.ScrollingEnabled = drag.WasScrolling
+	end
+
+	if drag then
+		self:Call(drag.Finish)
+	end
+end
+
+function Library:BindDrag(scope, target, move, finish)
+	target.Active = true
+
+	scope:Add(target.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1
+			and input.UserInputType ~= Enum.UserInputType.Touch
+		then
+			return
+		end
+
+		self:StopDrag()
+
+		local scroll = target:FindFirstAncestorWhichIsA("ScrollingFrame")
+
+		self.Drag = {
+			Owner = scope,
+			Input = input,
+			Move = move,
+			Finish = finish,
+			Scroll = scroll,
+			WasScrolling = scroll and scroll.ScrollingEnabled,
+		}
+
+		if scroll then
+			scroll.ScrollingEnabled = false
+		end
+
+		move(Vector2.new(input.Position.X, input.Position.Y))
+	end))
+
+	scope:Add(function()
+		if self.Drag and self.Drag.Owner == scope then
+			self:StopDrag()
+		end
+	end)
+end
+
+Library.Scope:Add(UserInputService.InputChanged:Connect(function(input)
+	local drag = Library.Drag
+	if not drag then
+		return
+	end
+
+	local mouse = drag.Input.UserInputType == Enum.UserInputType.MouseButton1
+
+	if input == drag.Input
+		or (mouse and input.UserInputType == Enum.UserInputType.MouseMovement)
+	then
+		drag.Move(Vector2.new(input.Position.X, input.Position.Y))
+	end
+end))
+
+Library.Scope:Add(UserInputService.InputEnded:Connect(function(input)
+	local drag = Library.Drag
+
+	if drag and (
+		input == drag.Input
+		or (
+			drag.Input.UserInputType == Enum.UserInputType.MouseButton1
+			and input.UserInputType == Enum.UserInputType.MouseButton1
+		)
+	) then
+		Library:StopDrag()
+	end
+end))
+
+Library.Scope:Add(UserInputService.WindowFocusReleased:Connect(function()
+	Library:StopDrag()
+end))
+
+Library.Scope:Add(UserInputService.InputBegan:Connect(function(input, processed)
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+
+	if Library.KeyCapture then
+		local capture = Library.KeyCapture
+		Library.KeyCapture = nil
+		capture(input.KeyCode ~= Enum.KeyCode.Escape and input.KeyCode or nil)
+		return
+	end
+
+	local window = Library.Window
+
+	if window and window.Popup then
+		if input.KeyCode == Enum.KeyCode.Escape then
+			window:ClosePopup()
+			return
+		end
+
+		if window.Popup.HandleKey and window.Popup.HandleKey(input.KeyCode) then
+			return
+		end
+	end
+
+	if processed or UserInputService:GetFocusedTextBox() then
+		return
+	end
+
+	if window and not window.Booting then
+		local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+			or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+
+		if ctrl and input.KeyCode == Enum.KeyCode.K then
+			window:OpenCommands()
+			return
+		end
+	end
+
+	for _, binding in Library.Keybinds do
+		if binding.Key == input.KeyCode then
+			Library:Call(binding.Callback)
+		end
+	end
+end))
+
+---------------------------------------------------------------------
+-- WINDOW / TABS
+---------------------------------------------------------------------
+
+local WindowClass = {}
+WindowClass.__index = WindowClass
+
+local TabClass = {}
+TabClass.__index = TabClass
+
+function Library:CreateWindow(options)
+	assert(not self.Window, "This single-file instance supports one window.")
+	options = options or {}
+
+	for key, value in options do
+		if self.Options[key] ~= nil or key == "HoverSound" then
+			self.Options[key] = value
+		end
+	end
+
+	self:SetTheme(options.Theme or "NeonPurple")
+
+	local old = PlayerGui:FindFirstChild("NOVA_SINGLE_FILE")
+	if old then
+		old:Destroy()
+	end
+
+	local window = setmetatable({
+		Scope = self.Scope:Child(),
+		Tabs = {},
+		Commands = {},
+		Notices = {},
+		DrawerOpen = false,
+		Mobile = false,
+		Minimized = false,
+		Booting = false,
+		Status = {
+			Name = "READY",
+			Message = "All interface systems operational.",
+			Progress = 0,
+			Started = self.Time,
+			Ended = self.Time,
+		},
+	}, WindowClass)
+
+	self.Window = window
+
+	local S = window.Scope
+
+	window.Gui = UI.New(S, "ScreenGui", PlayerGui, {
+		Name = "NOVA_SINGLE_FILE",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = false,
+		DisplayOrder = options.DisplayOrder or 50,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	})
+
+	-- Destroying the GUI externally also releases runtime connections.
+	S:Add(window.Gui.Destroying:Connect(function()
+		if Library.Scope.Alive then
+			Library:Destroy()
+		end
+	end))
+
+	window.Root = UI.New(S, "Frame", window.Gui, {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+	})
+
+	window.Shell = UI.Panel(S, window.Root, {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(1180, 760),
+		ClipsDescendants = true,
+	}, "Accent")
+
+	window.Scale = UI.New(S, "UIScale", window.Shell, {Scale = 1})
+
+	Effects:Background(window.Shell, S)
+
+	for index = 1, 3 do
+		local frame = UI.New(S, "Frame", window.Shell, {
+			Position = UDim2.fromOffset(index * 3, index * 3),
+			Size = UDim2.new(1, -index * 6, 1, -index * 6),
+			BackgroundTransparency = 1,
+			ZIndex = 3,
+		})
+
+		UI.Round(S, frame, 12)
+
+		local stroke = UI.Stroke(
+			S, frame,
+			index % 2 == 0 and "Secondary" or "Glow",
+			index == 1 and 2 or 1,
+			0.3 + index * 0.15
+		)
+
+		self:Watch(S, function()
+			stroke.Enabled = index == 1
+				or (self.Options.Glow and not self.Options.PerformanceMode)
+		end)
+	end
+
+	local outerStroke = UI.Stroke(S, window.Shell, "Accent", 2, 0.05)
+	local outerGradient = UI.Gradient(S, outerStroke, "Accent", "Secondary", 0)
+
+	self:Job(S, function(_, now)
+		if self:Motion() and self.Options.Effects and window.Shell.Visible then
+			outerGradient.Rotation = now * 23 % 360
+		end
+	end)
+
+	window.Header = UI.Panel(S, window.Shell, {
+		Position = UDim2.fromOffset(12, 12),
+		Size = UDim2.new(1, -24, 0, 86),
+		ZIndex = 10,
+	}, "Border")
+
+	window.Menu = UI.Button(S, window.Header, "☰", {
+		Position = UDim2.fromOffset(10, 12),
+		Size = UDim2.fromOffset(44, 44),
+	}, function()
+		window:ToggleDrawer()
+	end)
+
+	window.Logo = UI.Panel(S, window.Header, {
+		Position = UDim2.fromOffset(16, 16),
+		Size = UDim2.fromOffset(54, 54),
+	}, "Accent")
+
+	UI.Text(S, window.Logo, "N", {
+		Size = UDim2.fromScale(1, 1),
+		TextSize = 32,
+		Font = Enum.Font.GothamBlack,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	}, "Secondary")
+
+	window.Title = UI.Text(S, window.Header, options.Title or "N O V A", {
+		Position = UDim2.fromOffset(86, 16),
+		Size = UDim2.fromOffset(250, 32),
+		TextSize = 26,
+		Font = Enum.Font.GothamBlack,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+
+	window.Subtitle = UI.Text(
+		S, window.Header,
+		options.Subtitle or "ADVANCED COMMAND INTERFACE",
+		{
+			Position = UDim2.fromOffset(88, 50),
+			Size = UDim2.fromOffset(290, 18),
+			TextSize = 9,
+			Font = Enum.Font.Code,
+		},
+		"Muted"
+	)
+
+	window.Telemetry = UI.Text(S, window.Header, "● SYSTEM ONLINE", {
+		Position = UDim2.new(0.41, 0, 0, 20),
+		Size = UDim2.new(0.34, -20, 0, 48),
+		TextSize = 11,
+		Font = Enum.Font.Code,
+		TextWrapped = true,
+	}, "System")
+
+	window.SearchButton = UI.Button(S, window.Header, "⌕", {
+		Size = UDim2.fromOffset(44, 44),
+		AnchorPoint = Vector2.new(1, 0),
+	}, function()
+		window:OpenCommands()
+	end)
+
+	window.SettingsButton = UI.Button(S, window.Header, "CFG", {
+		Size = UDim2.fromOffset(44, 44),
+		AnchorPoint = Vector2.new(1, 0),
+	}, function()
+		for _, tab in window.Tabs do
+			if tab.Name == "Settings" then
+				window:SelectTab(tab)
+				break
+			end
+		end
+	end, "Settings")
+
+	window.MinButton = UI.Button(S, window.Header, "—", {
+		Size = UDim2.fromOffset(44, 44),
+		AnchorPoint = Vector2.new(1, 0),
+	}, function()
+		window.Minimized = not window.Minimized
+		window:Layout()
+	end)
+
+	window.CloseButton = UI.Button(S, window.Header, "×", {
+		Size = UDim2.fromOffset(44, 44),
+		AnchorPoint = Vector2.new(1, 0),
+	}, function()
+		self:Destroy()
+	end, "Error")
+
+	window.Content = UI.New(S, "Frame", window.Shell, {
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		ZIndex = 10,
+	})
+
+	window.DrawerOverlay = UI.New(S, "TextButton", window.Shell, {
+		Text = "",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.4,
+		Visible = false,
+		Active = true,
+		ZIndex = 25,
+	})
+
+	S:Add(window.DrawerOverlay.Activated:Connect(function()
+		window:ToggleDrawer(false)
+	end))
+
+	window.Sidebar = UI.Panel(S, window.Shell, {
+		ZIndex = 30,
+	}, "Border")
+
+	UI.Text(S, window.Sidebar, "COMMAND DIRECTORY", {
+		Position = UDim2.fromOffset(14, 12),
+		Size = UDim2.new(1, -28, 0, 24),
+		TextSize = 10,
+		Font = Enum.Font.Code,
+	}, "Muted")
+
+	window.Nav = UI.New(S, "ScrollingFrame", window.Sidebar, {
+		Position = UDim2.fromOffset(10, 44),
+		Size = UDim2.new(1, -26, 1, -56),
+		BackgroundTransparency = 1,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		ScrollBarThickness = 2,
+	}, {ScrollBarImageColor3 = "Accent"})
+
+	UI.Padding(S, window.Nav, 3)
+	UI.List(S, window.Nav, 10)
+
+	local grip = UI.New(S, "Frame", window.Sidebar, {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.fromScale(1, 0),
+		Size = UDim2.new(0, 18, 1, 0),
+		BackgroundTransparency = 0.88,
+	}, {BackgroundColor3 = "Accent"})
+
+	local swipeStart
+
+	self:BindDrag(S, grip, function(position)
+		if not window.Mobile then
+			return
+		end
+
+		swipeStart = swipeStart or position.X
+
+		if swipeStart - position.X > 60 then
+			window:ToggleDrawer(false)
+			self:StopDrag()
+		end
+	end, function()
+		swipeStart = nil
+	end)
+
+	window.Footer = UI.Text(
+		S, window.Shell,
+		"SYS // 07   |   CORE ONLINE   |   NOVA " .. (options.Version or "3.0.0"),
+		{
+			Position = UDim2.new(0, 18, 1, -30),
+			Size = UDim2.new(1, -36, 0, 18),
+			TextSize = 9,
+			Font = Enum.Font.Code,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			ZIndex = 10,
+		},
+		"Muted"
+	)
+
+	-- Persistent restore control for touch devices.
+	window.RestoreButton = UI.Button(S, window.Root, "N", {
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.new(0, 12, 1, -12),
+		Size = UDim2.fromOffset(50, 50),
+		Visible = false,
+		ZIndex = 150,
+	}, function()
+		window:Toggle(true)
+	end)
+
+	UI.Brackets(S, window.Shell, "Secondary")
+
+	S:Add(window.Root:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		window:Layout()
+	end))
+
+	self:Watch(S, function()
+		window:Layout()
+	end)
+
+	local nextTelemetry = 0
+
+	self:Job(S, function(_, now)
+		if now < nextTelemetry or not window.Shell.Visible then
+			return
+		end
+
+		nextTelemetry = now + 1
+
+		local ok, memory = pcall(function()
+			return StatsService:GetTotalMemoryUsageMb()
+		end)
+
+		window.Telemetry.Text = string.format(
+			"● SYSTEM ONLINE\nFPS %d  MEM %s MB",
+			math.round(self.FPS),
+			ok and tostring(math.round(memory)) or "--"
+		)
+	end)
+
+	window:Layout()
+	return window
+end
+
+function WindowClass:Layout()
+	if not self.Scope.Alive then
+		return
+	end
+
+	local viewport = self.Root.AbsoluteSize
+	if viewport.X < 10 or viewport.Y < 10 then
+		return
+	end
+
+	local scale = math.clamp(Library.Options.UIScale, 0.75, 1.5)
+	local width = math.min(1180, math.max(160, (viewport.X - 16) / scale))
+	local height = math.min(800, math.max(140, (viewport.Y - 16) / scale))
+
+	self.LogicalWidth = width
+	self.LogicalHeight = height
+	self.Mobile = viewport.X < 760 or width < 760
+
+	self.Scale.Scale = scale
+	self.Shell.Size = UDim2.fromOffset(width, self.Minimized and 114 or height)
+
+	local headerHeight = self.Mobile and 98 or 86
+	local top = self.Mobile and 122 or 110
+
+	self.Header.Size = UDim2.new(1, -24, 0, headerHeight)
+	self.Menu.Visible = self.Mobile
+	self.Logo.Visible = not self.Mobile
+	self.Subtitle.Visible = not self.Mobile
+	self.Telemetry.Visible = not self.Mobile and width >= 1000
+	self.SettingsButton.Visible = not self.Mobile
+
+	self.Title.Position = UDim2.fromOffset(self.Mobile and 66 or 86, 15)
+	self.Title.Size = UDim2.new(1, self.Mobile and -80 or -330, 0, 30)
+	self.Title.TextSize = self.Mobile and 20 or 26
+
+	local buttonY = self.Mobile and 48 or 20
+
+	self.SearchButton.Position = UDim2.new(1, self.Mobile and -120 or -172, 0, buttonY)
+	self.SettingsButton.Position = UDim2.new(1, -120, 0, buttonY)
+	self.MinButton.Position = UDim2.new(1, -68, 0, buttonY)
+	self.CloseButton.Position = UDim2.new(1, -16, 0, buttonY)
+
+	local left = self.Mobile and 14 or 226
+
+	self.Content.Position = UDim2.fromOffset(left, top)
+	self.Content.Size = UDim2.new(1, -(left + 16), 1, -(top + 42))
+	self.Content.Visible = not self.Minimized
+	self.Footer.Visible = not self.Minimized
+
+	local drawerWidth = math.min(252, width - 28)
+
+	self.Sidebar.Size = UDim2.new(
+		0, self.Mobile and drawerWidth or 196,
+		1, -(top + 42)
+	)
+
+	self.Sidebar.Position = UDim2.fromOffset(
+		self.Mobile and (self.DrawerOpen and 14 or -drawerWidth - 20) or 14,
+		top
+	)
+
+	self.Sidebar.Visible = not self.Minimized
+	self.DrawerOverlay.Visible = self.Mobile and self.DrawerOpen and not self.Minimized
+
+	if self.Popup then
+		self.Popup.Panel.Size = UDim2.new(
+			1, -28, 0, math.min(440, math.max(120, height - 28))
+		)
+	end
+
+	self:LayoutNotices()
+end
+
+function WindowClass:Toggle(force)
+	local visible = force
+	if visible == nil then
+		visible = not self.Shell.Visible
+	end
+
+	self.Shell.Visible = visible
+	self.RestoreButton.Visible = not visible
+
+	if not visible then
+		Library:StopDrag()
+		self:ClosePopup()
+	end
+end
+
+function WindowClass:ToggleDrawer(force)
+	if not self.Mobile then
+		return
+	end
+
+	if force == nil then
+		self.DrawerOpen = not self.DrawerOpen
+	else
+		self.DrawerOpen = force
+	end
+
+	self.DrawerOverlay.Visible = self.DrawerOpen and not self.Minimized
+
+	Library:Tween(self.Scope, self.Sidebar, 0.28, {
+		Position = UDim2.fromOffset(
+			self.DrawerOpen and 14 or -self.Sidebar.Size.X.Offset - 20,
+			122
+		),
+	}, "position")
+
+	if self.DrawerOpen then
+		Effects:EnergySweep(self.Sidebar, self.Scope)
+	end
+end
+
+function WindowClass:AddCommand(name, callback)
+	table.insert(self.Commands, {
+		Name = name,
+		Callback = callback,
+	})
+end
+
+function WindowClass:CreateTab(options)
+	local tab = setmetatable({
+		Window = self,
+		Scope = self.Scope:Child(),
+		Name = options.Name or "Page",
+		Order = 0,
+		Cards = {},
+	}, TabClass)
+
+	local S = tab.Scope
+
+	tab.Page = UI.New(S, "CanvasGroup", self.Content, {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Visible = false,
+	})
+
+	tab.Container = UI.New(S, "ScrollingFrame", tab.Page, {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		ScrollBarThickness = 3,
+	}, {ScrollBarImageColor3 = "Accent"})
+
+	UI.Padding(S, tab.Container, 7)
+	UI.List(S, tab.Container, 12)
+
+	tab.Nav = UI.Button(S, self.Nav, "", {
+		Size = UDim2.new(1, -2, 0, 82),
+		LayoutOrder = #self.Tabs + 1,
+	}, function()
+		self:SelectTab(tab)
+	end)
+
+	UI.Text(S, tab.Nav, "[ " .. string.upper(options.Icon or "SYS") .. " ]", {
+		Position = UDim2.fromOffset(12, 8),
+		Size = UDim2.new(1, -24, 0, 18),
+		TextSize = 10,
+		Font = Enum.Font.Code,
+	}, options.Accent or "Secondary")
+
+	UI.Text(S, tab.Nav, string.upper(tab.Name), {
+		Position = UDim2.fromOffset(12, 29),
+		Size = UDim2.new(1, -24, 0, 21),
+		TextSize = 12,
+	})
+
+	UI.Text(S, tab.Nav, options.Description or "COMMAND MODULE", {
+		Position = UDim2.fromOffset(12, 54),
+		Size = UDim2.new(1, -24, 0, 16),
+		TextSize = 8,
+		Font = Enum.Font.Code,
+	}, "Muted")
+
+	tab.ActiveBeam = UI.New(S, "Frame", tab.Nav, {
+		Position = UDim2.fromOffset(0, 8),
+		Size = UDim2.new(0, 3, 1, -16),
+		Visible = false,
+	}, {BackgroundColor3 = options.Accent or "Accent"})
+
+	table.insert(self.Tabs, tab)
+
+	self:AddCommand("Open " .. tab.Name, function()
+		self:SelectTab(tab)
+	end)
+
+	if not self.CurrentTab then
+		self:SelectTab(tab)
+	end
+
+	return tab
+end
+
+function WindowClass:SelectTab(tab)
+	if not tab.Scope.Alive then
+		return
+	end
+
+	Library:StopDrag()
+
+	if self.Transition then
+		self.Transition:Destroy()
+	end
+
+	local transition = self.Scope:Child()
+	self.Transition = transition
+
+	local old = self.CurrentTab
+	self.CurrentTab = tab
+
+	for _, other in self.Tabs do
+		other.ActiveBeam.Visible = other == tab
+		if other ~= old then
+			other.Page.Visible = false
+		end
+	end
+
+	local function reveal()
+		if old and old ~= tab then
+			old.Page.Visible = false
+		end
+
+		tab.Page.Visible = true
+		tab.Page.GroupTransparency = Library:Motion() and 1 or 0
+		tab.Page.Position = UDim2.fromOffset(Library:Motion() and 24 or 0, 0)
+
+		Library:Tween(transition, tab.Page, 0.3, {
+			GroupTransparency = 0,
+			Position = UDim2.fromOffset(0, 0),
+		})
+
+		for index, card in tab.Cards do
+			if index > 8 then
+				break
+			end
+
+			Library:After((index - 1) * 0.04, function()
+				if card.Parent then
+					Effects:Scale(card, transition, {From = 0.975, Duration = 0.3})
+					Effects:Shimmer(card, transition, {Duration = 0.35})
+				end
+			end, transition)
+		end
+
+		Effects:EnergySweep(tab.Nav, transition)
+	end
+
+	if old and old ~= tab and Library:Motion() then
+		Library:Tween(transition, old.Page, 0.12, {
+			GroupTransparency = 1,
+			Position = UDim2.fromOffset(-18, 0),
+		})
+
+		Library:After(0.13, reveal, transition)
+	else
+		reveal()
+	end
+
+	self:ToggleDrawer(false)
+end
+
+---------------------------------------------------------------------
+-- MODALS / COMMAND PALETTE / MANUAL COPY
+---------------------------------------------------------------------
+
+function WindowClass:ClosePopup()
+	if self.Popup then
+		local popup = self.Popup
+		self.Popup = nil
+		popup.Scope:Destroy()
+	end
+end
+
+function WindowClass:Modal(title)
+	self:Toggle(true)
+	self.Minimized = false
+	self:ClosePopup()
+	self:Layout()
+
+	local S = self.Scope:Child()
+
+	local layer = UI.New(S, "Frame", self.Shell, {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		ZIndex = 80,
+	})
+
+	local backdrop = UI.New(S, "TextButton", layer, {
+		Text = "",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.25,
+		Active = true,
+		ZIndex = 1,
+	})
+
+	local panel = UI.Panel(S, layer, {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(1, -28, 0, math.min(440, self.LogicalHeight - 28)),
+		ClipsDescendants = true,
+		Active = true,
+		ZIndex = 2,
+	}, "Accent")
+
+	UI.New(S, "UISizeConstraint", panel, {
+		MaxSize = Vector2.new(620, 480),
+	})
+
+	UI.Brackets(S, panel, "Secondary")
+
+	UI.Text(S, panel, title, {
+		Position = UDim2.fromOffset(16, 12),
+		Size = UDim2.new(1, -78, 0, 30),
+		TextSize = 12,
+		Font = Enum.Font.Code,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, "Secondary")
+
+	UI.Button(S, panel, "×", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -10, 0, 8),
+		Size = UDim2.fromOffset(44, 44),
+	}, function()
+		self:ClosePopup()
+	end, "Error")
+
+	S:Add(backdrop.Activated:Connect(function()
+		self:ClosePopup()
+	end))
+
+	self.Popup = {
+		Scope = S,
+		Panel = panel,
+	}
+
+	Effects:Scale(panel, S, {From = 0.94, Duration = 0.3})
+	Effects:Scanline(panel, S)
+
+	return self.Popup
+end
+
+function WindowClass:OpenPicker(title, items, callback)
+	local popup = self:Modal(title)
+	local S = popup.Scope
+
+	local query = UI.Field(S, popup.Panel, "", {
+		Position = UDim2.fromOffset(14, 58),
+		Size = UDim2.new(1, -28, 0, 46),
+		PlaceholderText = "SEARCH COMMANDS / OPTIONS...",
+	})
+
+	local list = UI.New(S, "ScrollingFrame", popup.Panel, {
+		Position = UDim2.fromOffset(14, 116),
+		Size = UDim2.new(1, -28, 1, -130),
+		BackgroundTransparency = 1,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 3,
+	}, {ScrollBarImageColor3 = "Accent"})
+
+	UI.List(S, list, 8)
+	UI.Padding(S, list, 3)
+
+	local renderScope
+	local shown = {}
+	local labels = {}
+	local selected = 1
+
+	local function choose(index)
+		local item = shown[index]
+		if not item then
+			return
+		end
+
+		self:ClosePopup()
+		Library:Call(callback, item)
+	end
+
+	local function highlight()
+		for index, label in labels do
+			label.Text = (index == selected and "> " or "  ")
+				.. (shown[index].Selected and "● " or "")
+				.. shown[index].Name
+		end
+	end
+
+	local function render()
+		if renderScope then
+			renderScope:Destroy()
+		end
+
+		renderScope = S:Child()
+		table.clear(shown)
+		table.clear(labels)
+		selected = 1
+
+		local filter = string.lower(query.Text)
+
+		for _, item in items do
+			if filter == "" or string.find(string.lower(item.Name), filter, 1, true) then
+				table.insert(shown, item)
+			end
+		end
+
+		for index, item in shown do
+			local button, label = UI.Button(renderScope, list, item.Name, {
+				LayoutOrder = index,
+				Size = UDim2.new(1, -4, 0, 48),
+			}, function()
+				choose(index)
+			end)
+
+			labels[index] = label
+
+			if index <= 6 then
+				Library:After(index * 0.025, function()
+					Effects:Shimmer(button, renderScope, {Duration = 0.3})
+				end, renderScope)
+			end
+		end
+
+		if #shown == 0 then
+			UI.Text(renderScope, list, "NO MATCHING COMMANDS", {
+				Size = UDim2.new(1, 0, 0, 48),
+				TextXAlignment = Enum.TextXAlignment.Center,
+			}, "Muted")
+		end
+
+		highlight()
+	end
+
+	popup.HandleKey = function(key)
+		if key == Enum.KeyCode.Down then
+			selected = math.min(selected + 1, math.max(#shown, 1))
+		elseif key == Enum.KeyCode.Up then
+			selected = math.max(selected - 1, 1)
+		elseif key == Enum.KeyCode.Return or key == Enum.KeyCode.KeypadEnter then
+			choose(selected)
+			return true
+		else
+			return false
+		end
+
+		highlight()
+
+		local top = (selected - 1) * 56
+		local current = list.CanvasPosition.Y
+
+		if top < current then
+			list.CanvasPosition = Vector2.new(0, top)
+		elseif top + 56 > current + list.AbsoluteSize.Y then
+			list.CanvasPosition = Vector2.new(0, top + 56 - list.AbsoluteSize.Y)
+		end
+
+		return true
+	end
+
+	S:Add(query:GetPropertyChangedSignal("Text"):Connect(render))
+	render()
+
+	if not UserInputService.TouchEnabled then
+		query:CaptureFocus()
+	end
+end
+
+function WindowClass:OpenCommands()
+	if self.Booting then
+		return
+	end
+
+	self:OpenPicker("NOVA // COMMAND PALETTE", self.Commands, function(command)
+		Library:Call(command.Callback)
+	end)
+end
+
+function WindowClass:TextDialog(title, text, readOnly, onApply)
+	local popup = self:Modal(title)
+	local S = popup.Scope
+
+	local field = UI.Field(S, popup.Panel, text, {
+		Position = UDim2.fromOffset(14, 58),
+		Size = UDim2.new(1, -28, 1, -126),
+		MultiLine = true,
+		TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextSize = 11,
+		Font = Enum.Font.Code,
+		TextEditable = true,
+	})
+
+	UI.Button(S, popup.Panel, readOnly and "SELECT ALL / COPY MANUALLY" or "APPLY JSON", {
+		Position = UDim2.new(0, 14, 1, -56),
+		Size = UDim2.new(1, -28, 0, 44),
+	}, function()
+		if readOnly then
+			field:CaptureFocus()
+			field.SelectionStart = 1
+			field.CursorPosition = #field.Text + 1
+		else
+			local result = field.Text
+			self:ClosePopup()
+			Library:Call(onApply, result)
+		end
+	end)
+
+	return field
+end
+
+---------------------------------------------------------------------
+-- COMPONENT FOUNDATIONS
+---------------------------------------------------------------------
+
+function TabClass:CreateSection(name)
+	self.Order += 1
+
+	return UI.Text(self.Scope, self.Container, "// " .. string.upper(name), {
+		LayoutOrder = self.Order,
+		Size = UDim2.new(1, 0, 0, 30),
+		TextSize = 11,
+		Font = Enum.Font.Code,
+	}, "Secondary")
+end
+
+function TabClass:Card(height, accent)
+	self.Order += 1
+
+	local S = self.Scope:Child()
+
+	local frame = UI.Panel(S, self.Container, {
+		Size = UDim2.new(1, -2, 0, height),
+		LayoutOrder = self.Order,
+		ClipsDescendants = true,
+	}, accent or "Border")
+
+	table.insert(self.Cards, frame)
+
+	S:Add(function()
+		local index = table.find(self.Cards, frame)
+		if index then
+			table.remove(self.Cards, index)
+		end
+	end)
+
+	return S, frame
+end
+
+local function controlRow(tab, options, height)
+	local S, frame = tab:Card(height, options.Accent)
+
+	UI.New(S, "Frame", frame, {
+		Position = UDim2.fromOffset(0, 14),
+		Size = UDim2.fromOffset(3, 26),
+	}, {BackgroundColor3 = options.Accent or "Accent"})
+
+	UI.Text(S, frame, string.upper(options.Name or "CONTROL"), {
+		Position = UDim2.fromOffset(16, 12),
+		Size = UDim2.new(1, -32, 0, 20),
+		TextSize = 12,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+
+	UI.Text(S, frame, options.Description or "", {
+		Position = UDim2.fromOffset(16, 35),
+		Size = UDim2.new(1, -32, 0, 30),
+		TextSize = 10,
+		TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+	}, "Muted")
+
+	local control = {
+		Scope = S,
+		Frame = frame,
+		Window = tab.Window,
+		Callback = options.Callback,
+	}
+
+	function control:Destroy()
+		self.Scope:Destroy()
+	end
+
+	return control
+end
+
+local function attachState(control, options, validator, renderer, default)
+	function control:Validate(value)
+		return validator(value)
+	end
+
+	function control:Set(value, silent)
+		if not self.Scope.Alive then
+			return
+		end
+
+		self.Value = validator(value)
+		renderer(self.Value)
+
+		if not silent then
+			Library:Call(self.Callback, self.Value)
+		end
+	end
+
+	control:Set(default, true)
+
+	if options.Id then
+		assert(not Library.Registry[options.Id], "Duplicate control Id: " .. options.Id)
+
+		Library.Registry[options.Id] = control
+
+		control.Scope:Add(function()
+			if Library.Registry[options.Id] == control then
+				Library.Registry[options.Id] = nil
+			end
+		end)
+	end
+
+	return control
+end
+
+local function numericRules(options)
+	local minimum = options.Min or 0
+	local maximum = options.Max or 100
+	local step = options.Step or 1
+
+	assert(finite(minimum) and finite(maximum) and maximum > minimum, "Invalid range")
+	assert(finite(step) and step > 0, "Invalid step")
+
+	local decimals = 0
+
+	while decimals < 6
+		and math.abs(step * 10 ^ decimals - math.round(step * 10 ^ decimals)) > 0.000001
+	do
+		decimals += 1
+	end
+
+	local function format(value)
+		return string.format("%." .. decimals .. "f", value)
+	end
+
+	local function validate(value)
+		local number = tonumber(value)
+		assert(finite(number), "Expected a finite number")
+
+		number = minimum + math.round((number - minimum) / step) * step
+		number = math.clamp(number, minimum, maximum)
+
+		return tonumber(format(number))
+	end
+
+	return validate, format, minimum, maximum, step
+end
+
+---------------------------------------------------------------------
+-- BUTTON / TOGGLE
+---------------------------------------------------------------------
+
+function TabClass:CreateButton(options)
+	local control = controlRow(self, options, 124)
+
+	control.Button = UI.Button(control.Scope, control.Frame,
+		(options.Icon and ("[ " .. options.Icon .. " ]  ") or "")
+			.. (options.Name or "COMMAND"),
+		{
+			Position = UDim2.fromOffset(16, 68),
+			Size = UDim2.new(1, -32, 0, 44),
+		},
+		function()
+			Effects:EnergySweep(control.Frame, control.Scope)
+			Library:Call(options.Callback)
+		end,
+		options.Accent or "Accent"
+	)
+
+	return control
+end
+
+function TabClass:CreateToggle(options)
+	local control = controlRow(self, options, 124)
+
+	local button, label = UI.Button(control.Scope, control.Frame, "", {
+		Position = UDim2.fromOffset(16, 68),
+		Size = UDim2.new(1, -32, 0, 44),
+	}, function()
+		control:Set(not control.Value)
+	end)
+
+	local beam = UI.New(control.Scope, "Frame", button, {
+		Position = UDim2.new(0, 12, 1, -6),
+		Size = UDim2.new(0.15, 0, 0, 2),
+	}, {BackgroundColor3 = "Success"})
+
+	return attachState(control, options, function(value)
+		assert(type(value) == "boolean", "Toggle expects boolean")
+		return value
+	end, function(value)
+		label.Text = value and "POWER  [ =====● ]  ACTIVE"
+			or "POWER  [ ●----- ]  STANDBY"
+
+		Library:Tween(control.Scope, beam, 0.25, {
+			Size = UDim2.new(value and 0.88 or 0.15, 0, 0, 2),
+			BackgroundTransparency = value and 0 or 0.7,
+		})
+
+		if value then
+			Effects:Pulse(button, control.Scope)
+		end
+	end, options.Default == true)
+end
+
+---------------------------------------------------------------------
+-- SLIDER
+---------------------------------------------------------------------
+
+function TabClass:CreateSlider(options)
+	local control = controlRow(self, options, 164)
+	local S = control.Scope
+	local validate, format, minimum, maximum = numericRules(options)
+
+	local valueLabel = UI.Text(S, control.Frame, "", {
+		Position = UDim2.fromOffset(16, 66),
+		Size = UDim2.new(1, -32, 0, 22),
+		Font = Enum.Font.Code,
+	}, "System")
+
+	local hit = UI.New(S, "TextButton", control.Frame, {
+		Text = "",
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(22, 90),
+		Size = UDim2.new(1, -44, 0, 44),
+	})
+
+	local track = UI.New(S, "Frame", hit, {
+		Position = UDim2.new(0, 0, 0.5, -3),
+		Size = UDim2.new(1, 0, 0, 6),
+	}, {BackgroundColor3 = "Background"})
+
+	UI.Round(S, track, 8)
+
+	local fill = UI.New(S, "Frame", track, {
+		Size = UDim2.fromScale(0, 1),
+	}, {BackgroundColor3 = "Accent"})
+
+	UI.Round(S, fill, 8)
+	UI.Gradient(S, fill, "Accent", "Secondary", 0)
+
+	for index = 0, 10 do
+		UI.New(S, "Frame", hit, {
+			Position = UDim2.new(index / 10, 0, 0.5, 11),
+			Size = UDim2.fromOffset(1, index % 5 == 0 and 7 or 4),
+			BackgroundTransparency = 0.45,
+		}, {BackgroundColor3 = "Muted"})
+	end
+
+	local thumb = UI.New(S, "Frame", hit, {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.fromOffset(22, 22),
+	}, {BackgroundColor3 = "Text"})
+
+	UI.Round(S, thumb, 20)
+	UI.Stroke(S, thumb, "Accent", 3, 0.1)
+
+	UI.Text(S, control.Frame, tostring(minimum), {
+		Position = UDim2.fromOffset(16, 143),
+		Size = UDim2.fromOffset(90, 16),
+		TextSize = 10,
+	}, "Muted")
+
+	UI.Text(S, control.Frame, tostring(maximum), {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -16, 0, 143),
+		Size = UDim2.fromOffset(90, 16),
+		TextSize = 10,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	}, "Muted")
+
+	attachState(control, options, validate, function(value)
+		local alpha = (value - minimum) / (maximum - minimum)
+
+		fill.Size = UDim2.fromScale(alpha, 1)
+		thumb.Position = UDim2.fromScale(alpha, 0.5)
+
+		valueLabel.Text = "VALUE // " .. format(value)
+			.. (options.Percentage and ("  |  " .. math.round(alpha * 100) .. "%") or "")
+	end, options.Default or minimum)
+
+	local lastBurst = -1
+
+	Library:BindDrag(S, hit, function(position)
+		local alpha = math.clamp(
+			(position.X - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1),
+			0, 1
+		)
+
+		local value = validate(minimum + (maximum - minimum) * alpha)
+
+		if value ~= control.Value then
+			control:Set(value)
+		end
+
+		if Library.Time - lastBurst > 0.18 then
+			lastBurst = Library.Time
+			Effects:ParticleBurst(thumb, S, {Count = 5, Duration = 0.3})
+		end
+	end)
+
+	return control
+end
+
+---------------------------------------------------------------------
+-- INPUT / DROPDOWN
+---------------------------------------------------------------------
+
+function TabClass:CreateInput(options)
+	local control = controlRow(self, options, 124)
+	local S = control.Scope
+
+	local numeric = options.Numeric == true
+	local validate, format, step
+
+	if numeric then
+		local numericValidate, numericFormat, _, _, numericStep = numericRules(options)
+		validate, format, step = numericValidate, numericFormat, numericStep
+	else
+		validate = function(value)
+			assert(type(value) == "string", "Input expects string")
+			return string.sub(value, 1, options.MaxLength or 4096)
+		end
+		format = tostring
+	end
+
+	local field = UI.Field(S, control.Frame, "", {
+		Position = UDim2.fromOffset(numeric and 68 or 16, 68),
+		Size = UDim2.new(1, numeric and -136 or -32, 0, 44),
+		TextXAlignment = numeric and Enum.TextXAlignment.Center or Enum.TextXAlignment.Left,
+		PlaceholderText = options.Placeholder or "ENTER VALUE",
+	})
+
+	attachState(control, options, validate, function(value)
+		field.Text = format(value)
+	end, options.Default or (numeric and (options.Min or 0) or ""))
+
+	S:Add(field.FocusLost:Connect(function()
+		local ok, value = pcall(validate, field.Text)
+
+		if ok then
+			control:Set(value)
+		else
+			field.Text = format(control.Value)
+			Effects:Glitch(control.Frame, S)
+		end
+	end))
+
+	if numeric then
+		UI.Button(S, control.Frame, "−", {
+			Position = UDim2.fromOffset(16, 68),
+			Size = UDim2.fromOffset(44, 44),
+		}, function()
+			control:Set(control.Value - step)
+		end)
+
+		UI.Button(S, control.Frame, "+", {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -16, 0, 68),
+			Size = UDim2.fromOffset(44, 44),
+		}, function()
+			control:Set(control.Value + step)
+		end)
+	end
+
+	control.Field = field
+	return control
+end
+
+function TabClass:CreateDropdown(options)
+	local control = controlRow(self, options, 124)
+	local values = options.Values or {}
+
+	assert(#values > 0, "Dropdown requires Values")
+
+	local _, label = UI.Button(control.Scope, control.Frame, "", {
+		Position = UDim2.fromOffset(16, 68),
+		Size = UDim2.new(1, -32, 0, 44),
+	}, function()
+		local items = {}
+
+		for _, value in values do
+			table.insert(items, {
+				Name = tostring(value),
+				Value = value,
+				Selected = value == control.Value,
+			})
+		end
+
+		self.Window:OpenPicker(options.Name or "SELECT MODE", items, function(item)
+			control:Set(item.Value)
+		end)
+	end)
+
+	return attachState(control, options, function(value)
+		assert(table.find(values, value), "Invalid dropdown value")
+		return value
+	end, function(value)
+		label.Text = "[ " .. tostring(value) .. " ]   ▾"
+	end, options.Default or values[1])
+end
+
+---------------------------------------------------------------------
+-- KEYBIND / COLOR PICKER
+---------------------------------------------------------------------
+
+function TabClass:CreateKeybind(options)
+	local control = controlRow(self, options, 124)
+	local token = {}
+	local capture
+
+	local _, label
+	_, label = UI.Button(control.Scope, control.Frame, "", {
+		Position = UDim2.fromOffset(16, 68),
+		Size = UDim2.new(1, -32, 0, 44),
+	}, function()
+		if Library.KeyCapture then
+			return
+		end
+
+		label.Text = "PRESS A KEY / ESC TO CANCEL"
+
+		capture = function(key)
+			if not control.Scope.Alive then
+				return
+			end
+
+			if key then
+				control:Set(key.Name)
+			else
+				label.Text = "[ " .. control.Value .. " ]"
+			end
+		end
+
+		Library.KeyCapture = capture
+	end)
+
+	control.Scope:Add(function()
+		Library.Keybinds[token] = nil
+
+		if capture and Library.KeyCapture == capture then
+			Library.KeyCapture = nil
+		end
+	end)
+
+	return attachState(control, options, function(value)
+		if typeof(value) == "EnumItem" then
+			value = value.Name
+		end
+
+		assert(type(value) == "string", "Expected a KeyCode name")
+
+		local ok, key = pcall(function()
+			return Enum.KeyCode[value]
+		end)
+
+		assert(ok and key and key ~= Enum.KeyCode.Unknown, "Invalid key")
+		return value
+	end, function(value)
+		label.Text = "[ " .. value .. " ]"
+
+		Library.Keybinds[token] = {
+			Key = Enum.KeyCode[value],
+			Callback = options.OnPressed,
+		}
+	end, options.Default or "RightShift")
+end
+
+function TabClass:CreateColorPicker(options)
+	local control = controlRow(self, options, 320)
+	local S = control.Scope
+
+	local swatch = UI.New(S, "Frame", control.Frame, {
+		Position = UDim2.fromOffset(16, 68),
+		Size = UDim2.new(1, -32, 0, 36),
+	})
+
+	UI.Round(S, swatch, 7)
+	UI.Stroke(S, swatch, "Border")
+
+	local hsv = {0, 1, 1}
+	local axes = {}
+
+	for index, name in {"HUE", "SATURATION", "VALUE"} do
+		local y = 118 + (index - 1) * 64
+
+		local label = UI.Text(S, control.Frame, name, {
+			Position = UDim2.fromOffset(16, y),
+			Size = UDim2.new(1, -32, 0, 16),
+			TextSize = 10,
+			Font = Enum.Font.Code,
+		}, "Muted")
+
+		local hit = UI.New(S, "TextButton", control.Frame, {
+			Position = UDim2.fromOffset(16, y + 16),
+			Size = UDim2.new(1, -32, 0, 44),
+			Text = "",
+			BackgroundTransparency = 1,
+		})
+
+		local track = UI.New(S, "Frame", hit, {
+			Position = UDim2.new(0, 0, 0.5, -3),
+			Size = UDim2.new(1, 0, 0, 6),
+		}, {BackgroundColor3 = "Background"})
+
+		local fill = UI.New(S, "Frame", track, {
+			Size = UDim2.fromScale(1, 1),
+		}, {BackgroundColor3 = "Accent"})
+
+		UI.Round(S, track, 5)
+		UI.Round(S, fill, 5)
+
+		axes[index] = {Fill = fill, Label = label, Name = name}
+
+		Library:BindDrag(S, hit, function(position)
+			hsv[index] = math.clamp(
+				(position.X - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1),
+				0, 1
+			)
+
+			control:Set(Color3.fromHSV(hsv[1], hsv[2], hsv[3]))
+		end)
+	end
+
+	return attachState(control, options, function(value)
+		assert(typeof(value) == "Color3", "ColorPicker expects Color3")
+		return value
+	end, function(value)
+		hsv[1], hsv[2], hsv[3] = value:ToHSV()
+		swatch.BackgroundColor3 = value
+
+		for index, axis in axes do
+			axis.Fill.Size = UDim2.fromScale(hsv[index], 1)
+			axis.Label.Text = axis.Name .. " // " .. math.round(hsv[index] * 100) .. "%"
+		end
+	end, options.Default or Library.Palette.Accent)
+end
+
+---------------------------------------------------------------------
+-- HERO / SYSTEM CARDS / EXECUTION MONITOR
+---------------------------------------------------------------------
+
+function TabClass:CreateHero(options)
+	options = options or {}
+
+	local S, hero = self:Card(260, "Accent")
+
+	Effects:Background(hero, S, 14)
+	UI.Brackets(S, hero, "Secondary")
+
+	local content = UI.New(S, "Frame", hero, {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		ZIndex = 5,
+	})
+
+	UI.Text(S, content, "● SYSTEM ONLINE // OPERATOR AUTHORIZED", {
+		Position = UDim2.fromOffset(20, 20),
+		Size = UDim2.new(1, -40, 0, 32),
+		TextSize = 10,
+		TextWrapped = true,
+		Font = Enum.Font.Code,
+	}, "System")
+
+	UI.Text(S, content, options.Title or "Welcome back,\nOperator.", {
+		Position = UDim2.fromOffset(20, 62),
+		Size = UDim2.new(1, -40, 0, 86),
+		TextSize = 30,
+		TextWrapped = true,
+		Font = Enum.Font.GothamBlack,
+	})
+
+	UI.Text(S, content, options.Description or "ALL SYSTEMS OPERATIONAL", {
+		Position = UDim2.fromOffset(20, 151),
+		Size = UDim2.new(1, -40, 0, 28),
+		TextSize = 10,
+		TextWrapped = true,
+		Font = Enum.Font.Code,
+	}, "Secondary")
+
+	UI.Button(S, content, "EXECUTE", {
+		Position = UDim2.fromOffset(20, 194),
+		Size = UDim2.new(0.5, -26, 0, 46),
+	}, options.OnExecute, "Executor")
+
+	UI.Button(S, content, "CONSOLE", {
+		Position = UDim2.new(0.5, 6, 0, 194),
+		Size = UDim2.new(0.5, -26, 0, 46),
+	}, options.OnConsole, "Console")
+
+	return hero
+end
+
+function TabClass:CreateStats(entries)
+	self.Order += 1
+
+	local S = self.Scope:Child()
+
+	local holder = UI.New(S, "Frame", self.Container, {
+		LayoutOrder = self.Order,
+		Size = UDim2.new(1, -2, 0, 300),
+		BackgroundTransparency = 1,
+	})
+
+	local grid = UI.New(S, "UIGridLayout", holder, {
+		CellPadding = UDim2.fromOffset(12, 12),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	})
+
+	local labels = {}
+
+	for index, entry in entries do
+		local card = UI.Panel(S, holder, {
+			LayoutOrder = index,
+			ClipsDescendants = true,
+		}, entry.Accent or "Accent")
+
+		UI.Text(S, card, "[ " .. string.upper(entry.Name) .. " ]", {
+			Position = UDim2.fromOffset(14, 12),
+			Size = UDim2.new(1, -28, 0, 18),
+			TextSize = 10,
+			Font = Enum.Font.Code,
+		}, entry.Accent or "Secondary")
+
+		labels[index] = UI.Text(S, card, tostring(entry.Value), {
+			Position = UDim2.fromOffset(14, 38),
+			Size = UDim2.new(1, -28, 0, 34),
+			TextSize = 25,
+			Font = Enum.Font.GothamBlack,
+		})
+
+		UI.Text(S, card, entry.Description or "SYSTEM NOMINAL", {
+			Position = UDim2.fromOffset(14, 78),
+			Size = UDim2.new(1, -28, 0, 26),
+			TextSize = 9,
+			TextWrapped = true,
+			Font = Enum.Font.Code,
+		}, "Muted")
+
+		-- Decorative signal pattern, not telemetry.
+		for barIndex = 1, 14 do
+			local height = 4 + (barIndex * 7 + index * 3) % 13
+
+			UI.New(S, "Frame", card, {
+				Position = UDim2.new(
+					(barIndex - 1) / 16, 14,
+					1, -12 - height
+				),
+				Size = UDim2.new(1 / 22, 0, 0, height),
+				BackgroundTransparency = 0.35,
+			}, {BackgroundColor3 = entry.Accent or "Accent"})
+		end
+	end
+
+	local function layout()
+		local width = holder.AbsoluteSize.X / math.max(self.Window.Scale.Scale, 0.1)
+		local columns = width >= 690 and 3 or (width >= 470 and 2 or 1)
+
+		grid.CellSize = UDim2.new(
+			1 / columns, -12 * (columns - 1) / columns,
+			0, 142
+		)
+
+		holder.Size = UDim2.new(
+			1, -2, 0,
+			math.ceil(#entries / columns) * 154 - 12
+		)
+	end
+
+	S:Add(holder:GetPropertyChangedSignal("AbsoluteSize"):Connect(layout))
+	layout()
+
+	return {
+		Set = function(_, index, value)
+			if S.Alive and labels[index] then
+				labels[index].Text = tostring(value)
+			end
+		end,
+	}
+end
+
+function TabClass:CreateMonitor()
+	local S, panel = self:Card(244, "Executor")
+	local window = self.Window
+
+	UI.Brackets(S, panel, "Executor")
+
+	UI.Text(S, panel, "LIVE EXECUTION MONITOR", {
+		Position = UDim2.fromOffset(18, 16),
+		Size = UDim2.new(1, -36, 0, 24),
+		TextSize = 11,
+		Font = Enum.Font.Code,
+	}, "Executor")
+
+	local state = UI.Text(S, panel, "", {
+		Position = UDim2.fromOffset(18, 56),
+		Size = UDim2.new(1, -36, 0, 30),
+		TextSize = 22,
+		Font = Enum.Font.GothamBold,
+	})
+
+	local message = UI.Text(S, panel, "", {
+		Position = UDim2.fromOffset(18, 96),
+		Size = UDim2.new(1, -36, 0, 38),
+		TextWrapped = true,
+		TextSize = 12,
+	}, "Muted")
+
+	local track = UI.New(S, "Frame", panel, {
+		Position = UDim2.fromOffset(18, 146),
+		Size = UDim2.new(1, -36, 0, 10),
+	}, {BackgroundColor3 = "Background"})
+
+	UI.Round(S, track, 6)
+
+	local fill = UI.New(S, "Frame", track, {
+		Size = UDim2.fromScale(0, 1),
+	}, {BackgroundColor3 = "Executor"})
+
+	UI.Round(S, fill, 6)
+	UI.Gradient(S, fill, "Executor", "Secondary", 0)
+
+	local meta = UI.Text(S, panel, "", {
+		Position = UDim2.fromOffset(18, 174),
+		Size = UDim2.new(1, -36, 0, 52),
+		TextSize = 11,
+		TextWrapped = true,
+		Font = Enum.Font.Code,
+	}, "System")
+
+	Library:Job(S, function(_, now)
+		local status = window.Status
+		local elapsed = math.max(0, (status.Ended or now) - status.Started)
+
+		state.Text = "● " .. status.Name
+		message.Text = status.Message
+		fill.Size = UDim2.fromScale(status.Progress, 1)
+
+		meta.Text = string.format(
+			"PROGRESS  %03d%%\nELAPSED   %02d:%05.2f",
+			math.round(status.Progress * 100),
+			math.floor(elapsed / 60),
+			elapsed % 60
+		)
+
+		state.TextTransparency = Library:Motion() and not status.Ended
+			and (0.08 + math.sin(now * 4) * 0.07)
+			or 0
+	end)
+
+	return panel
+end
+
+local ValidStates = {
+	IDLE = true, READY = true, LOADING = true,
+	INITIALIZING = true, EXECUTING = true, PROCESSING = true,
+	FINALIZING = true, SUCCESS = true, WARNING = true,
+	ERROR = true, COMPLETED = true,
+}
+
+local TerminalStates = {
+	IDLE = true, READY = true, SUCCESS = true,
+	WARNING = true, ERROR = true, COMPLETED = true,
+}
+
+function Library:SetStatus(name, message, progress)
+	assert(self.Window, "CreateWindow first")
+	assert(ValidStates[name], "Unknown status")
+
+	if progress ~= nil then
+		assert(finite(progress), "Progress must be finite")
+	end
+
+	local previous = self.Window.Status
+	local starting = TerminalStates[previous.Name] and not TerminalStates[name]
+
+	self.Window.Status = {
+		Name = name,
+		Message = message or "",
+		Progress = progress == nil and previous.Progress or math.clamp(progress, 0, 1),
+		Started = starting and self.Time or previous.Started,
+		Ended = TerminalStates[name] and self.Time or nil,
+	}
+
+	if name == "COMPLETED" or name == "SUCCESS" then
+		self.Window.Status.Progress = 1
+	end
+
+	if self.Window.Console then
+		local level = name == "ERROR" and "ERROR"
+			or name == "WARNING" and "WARNING"
+			or (name == "SUCCESS" or name == "COMPLETED") and "SUCCESS"
+			or "INFO"
+
+		self.Window.Console:Log(level, name .. " // " .. (message or ""))
+	end
+end
+
+function Library:SetProgress(progress, message)
+	assert(finite(progress), "Progress must be finite")
+
+	self.Window.Status.Progress = math.clamp(progress, 0, 1)
+
+	if message then
+		self.Window.Status.Message = message
+	end
+end
+
+---------------------------------------------------------------------
+-- NOTIFICATIONS
+---------------------------------------------------------------------
+
+function WindowClass:LayoutNotices()
+	local width = math.min(370, math.max(160, self.Root.AbsoluteSize.X - 24))
+
+	for index, notice in self.Notices do
+		notice.Panel.Size = UDim2.fromOffset(width, 112)
+
+		Library:Tween(notice.Scope, notice.Panel, 0.22, {
+			Position = UDim2.new(1, -12, 1, -12 - (index - 1) * 124),
+		}, "position")
+	end
+end
+
+function Library:Notify(options)
+	local window = self.Window
+	assert(window, "CreateWindow first")
+
+	while #window.Notices >= 4 do
+		local old = table.remove(window.Notices, 1)
+		old.Scope:Destroy()
+	end
+
+	local S = window.Scope:Child()
+
+	local role = ({
+		Success = "Success",
+		Warning = "Warning",
+		Error = "Error",
+		System = "System",
+	})[options.Type or "System"] or "System"
+
+	local panel = UI.Panel(S, window.Root, {
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, 400, 1, -12),
+		Size = UDim2.fromOffset(370, 112),
+		ZIndex = 100,
+		ClipsDescendants = true,
+	}, role)
+
+	UI.Brackets(S, panel, role)
+
+	UI.Text(S, panel, options.Title or "SYSTEM ALERT", {
+		Position = UDim2.fromOffset(14, 12),
+		Size = UDim2.new(1, -28, 0, 22),
+		TextSize = 12,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, role)
+
+	UI.Text(S, panel, options.Description or "", {
+		Position = UDim2.fromOffset(14, 40),
+		Size = UDim2.new(1, -28, 0, 48),
+		TextSize = 11,
+		TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+	})
+
+	local bar = UI.New(S, "Frame", panel, {
+		Position = UDim2.new(0, 10, 1, -8),
+		Size = UDim2.new(1, -20, 0, 2),
+	}, {BackgroundColor3 = role})
+
+	local notice = {Scope = S, Panel = panel}
+	table.insert(window.Notices, notice)
+
+	local closing = false
+
+	local function dismiss()
+		if closing or not S.Alive then
+			return
+		end
+
+		closing = true
+
+		local index = table.find(window.Notices, notice)
+		if index then
+			table.remove(window.Notices, index)
+		end
+
+		window:LayoutNotices()
+
+		Library:Tween(S, panel, 0.2, {
+			Position = UDim2.new(1, 400, 1, panel.Position.Y.Offset),
+		}, "position")
+
+		Library:After(0.22, function()
+			S:Destroy()
+		end, S)
+	end
+
+	local start = self.Time
+	local duration = math.max(0.5, options.Duration or 4)
+
+	self:Job(S, function(_, now)
+		local remaining = 1 - math.clamp((now - start) / duration, 0, 1)
+		bar.Size = UDim2.new(remaining, -20 * remaining, 0, 2)
+	end)
+
+	self:After(duration, dismiss, S)
+
+	window:LayoutNotices()
+	Effects:Glow(panel, S)
+
+	return {Dismiss = dismiss}
+end
+
+---------------------------------------------------------------------
+-- CONSOLE
+---------------------------------------------------------------------
+
+local ConsoleClass = {}
+ConsoleClass.__index = ConsoleClass
+
+local LogRoles = {
+	INFO = "System",
+	SUCCESS = "Success",
+	WARNING = "Warning",
+	ERROR = "Error",
+	DEBUG = "Muted",
+}
+
+function WindowClass:CreateConsole(options)
+	local tab = self:CreateTab(options or {
+		Name = "Console",
+		Icon = ">_",
+		Accent = "Console",
+	})
+
+	local console = setmetatable({
+		Window = self,
+		Tab = tab,
+		Scope = tab.Scope:Child(),
+		Logs = {},
+		Level = "ALL",
+		Query = "",
+		AutoScroll = true,
+		MaxLogs = 160,
+		Pending = false,
+	}, ConsoleClass)
+
+	self.Console = console
+	local S = console.Scope
+
+	tab:CreateSection("LIVE DEVELOPER TERMINAL")
+
+	local toolsScope, tools = tab:Card(176, "Console")
+
+	local search = UI.Field(toolsScope, tools, "", {
+		Position = UDim2.fromOffset(12, 12),
+		Size = UDim2.new(1, -24, 0, 44),
+		PlaceholderText = "SEARCH LOGS...",
+	})
+
+	toolsScope:Add(search:GetPropertyChangedSignal("Text"):Connect(function()
+		console.Query = string.lower(search.Text)
+		console:Refresh()
+	end))
+
+	UI.Button(toolsScope, tools, "FILTER", {
+		Position = UDim2.fromOffset(12, 66),
+		Size = UDim2.new(0.5, -18, 0, 44),
+	}, function()
+		local items = {}
+
+		for _, level in {"ALL", "INFO", "SUCCESS", "WARNING", "ERROR", "DEBUG"} do
+			table.insert(items, {Name = level})
+		end
+
+		self:OpenPicker("LOG LEVEL", items, function(item)
+			console.Level = item.Name
+			console:Refresh()
+		end)
+	end, "Console")
+
+	UI.Button(toolsScope, tools, "COPY", {
+		Position = UDim2.new(0.5, 6, 0, 66),
+		Size = UDim2.new(0.5, -18, 0, 44),
+	}, function()
+		self:TextDialog("CONSOLE // COPY MANUALLY", console:Export(), true)
+	end, "Console")
+
+	UI.Button(toolsScope, tools, "CLEAR", {
+		Position = UDim2.fromOffset(12, 120),
+		Size = UDim2.new(0.5, -18, 0, 44),
+	}, function()
+		table.clear(console.Logs)
+		console:Refresh()
+	end, "Warning")
+
+	local _, autoLabel
+	_, autoLabel = UI.Button(toolsScope, tools, "AUTO SCROLL: ON", {
+		Position = UDim2.new(0.5, 6, 0, 120),
+		Size = UDim2.new(0.5, -18, 0, 44),
+	}, function()
+		console.AutoScroll = not console.AutoScroll
+		autoLabel.Text = "AUTO SCROLL: " .. (console.AutoScroll and "ON" or "OFF")
+	end, "Console")
+
+	local terminalScope, terminal = tab:Card(370, "Console")
+	UI.Brackets(terminalScope, terminal, "Console")
+
+	console.List = UI.New(terminalScope, "ScrollingFrame", terminal, {
+		Position = UDim2.fromOffset(12, 12),
+		Size = UDim2.new(1, -24, 1, -54),
+		BackgroundTransparency = 1,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		ScrollBarThickness = 3,
+	}, {ScrollBarImageColor3 = "Console"})
+
+	UI.List(terminalScope, console.List, 7)
+
+	local cursor = UI.Text(terminalScope, terminal, "", {
+		Position = UDim2.new(0, 14, 1, -30),
+		Size = UDim2.new(1, -28, 0, 20),
+		TextSize = 11,
+		Font = Enum.Font.Code,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, "Success")
+
+	local started = Library.Time
+	local message = "> INTERFACE CONNECTED // SYSTEM READY"
+
+	Library:Job(S, function(_, now)
+		local typing = Library.Options.TerminalTyping and Library:Motion()
+		local count = typing and math.floor((now - started) * 24) or #message
+		local blink = Library:Motion() and math.floor(now * 2) % 2 == 0
+
+		cursor.Text = string.sub(message, 1, math.min(count, #message))
+			.. (blink and "_" or " ")
+	end)
+
+	terminalScope:Add(console.List:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function()
+		if console.AutoScroll then
+			console.List.CanvasPosition = Vector2.new(
+				0,
+				math.max(0, console.List.AbsoluteCanvasSize.Y - console.List.AbsoluteSize.Y)
+			)
+		end
+	end))
+
+	console:Log("SUCCESS", "NOVA console attached.")
+	return console, tab
+end
+
+function ConsoleClass:Log(level, message)
+	if not self.Scope.Alive then
+		return
+	end
+
+	level = string.upper(level or "INFO")
+
+	if not LogRoles[level] then
+		level = "INFO"
+	end
+
+	table.insert(self.Logs, {
+		Time = os.date("%H:%M:%S"),
+		Level = level,
+		Message = string.sub(tostring(message), 1, 3000),
+	})
+
+	while #self.Logs > self.MaxLogs do
+		table.remove(self.Logs, 1)
+	end
+
+	self:Refresh()
+end
+
+function ConsoleClass:Export()
+	local lines = {}
+
+	for _, log in self.Logs do
+		table.insert(lines, string.format(
+			"[%s] [%s] %s", log.Time, log.Level, log.Message
+		))
+	end
+
+	return table.concat(lines, "\n")
+end
+
+function ConsoleClass:Refresh()
+	if self.Pending or not self.Scope.Alive then
+		return
+	end
+
+	self.Pending = true
+
+	Library:After(0, function()
+		self.Pending = false
+
+		if self.RenderScope then
+			self.RenderScope:Destroy()
+		end
+
+		self.RenderScope = self.Scope:Child()
+
+		for index, log in self.Logs do
+			local matchesLevel = self.Level == "ALL" or self.Level == log.Level
+			local matchesQuery = self.Query == ""
+				or string.find(string.lower(log.Message), self.Query, 1, true)
+
+			if matchesLevel and matchesQuery then
+				UI.Text(
+					self.RenderScope,
+					self.List,
+					string.format("[%s] [%s] %s", log.Time, log.Level, log.Message),
+					{
+						LayoutOrder = index,
+						Size = UDim2.new(1, -10, 0, 0),
+						AutomaticSize = Enum.AutomaticSize.Y,
+						TextWrapped = true,
+						TextSize = 11,
+						TextYAlignment = Enum.TextYAlignment.Top,
+						Font = Enum.Font.Code,
+					},
+					LogRoles[log.Level]
+				)
+			end
+		end
+	end, self.Scope)
+end
+
+---------------------------------------------------------------------
+-- CINEMATIC BOOT
+---------------------------------------------------------------------
+
+function Library:Boot(options)
+	options = options or {}
+
+	local window = self.Window
+	assert(window, "CreateWindow first")
+
+	if window.BootScope then
+		window.BootScope:Destroy()
+	end
+
+	window:Toggle(true)
+	window:ClosePopup()
+	window.Minimized = false
+	window:Layout()
+	window.Booting = true
+
+	local S = window.Scope:Child()
+	window.BootScope = S
+
+	S:Add(function()
+		window.Booting = false
+	end)
+
+	local duration = math.max(0.5, options.Duration or 3)
+	local started = self.Time
+
+	local cover = UI.New(S, "TextButton", window.Shell, {
+		Size = UDim2.fromScale(1, 1),
+		Text = "",
+		Active = true,
+		ZIndex = 120,
+	}, {BackgroundColor3 = "Background"})
+
+	Effects:Background(cover, S, 28)
+
+	local content = UI.New(S, "Frame", cover, {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(1, -32, 0, 370),
+		BackgroundTransparency = 1,
+		ZIndex = 5,
+	})
+
+	UI.New(S, "UISizeConstraint", content, {
+		MaxSize = Vector2.new(560, 370),
+	})
+
+	local bootScale = UI.New(S, "UIScale", content, {Scale = 1})
+
+	local function fit()
+		bootScale.Scale = math.min(
+			1,
+			math.max(
+				0.2,
+				(window.Shell.AbsoluteSize.Y / window.Scale.Scale - 24) / 370
+			)
+		)
+	end
+
+	S:Add(window.Shell:GetPropertyChangedSignal("AbsoluteSize"):Connect(fit))
+	fit()
+
+	UI.Brackets(S, content, "System")
+
+	local logo = UI.Text(S, content, options.Logo or "N O V A", {
+		Position = UDim2.fromOffset(12, 22),
+		Size = UDim2.new(1, -24, 0, 70),
+		TextSize = 50,
+		TextScaled = true,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Font = Enum.Font.GothamBlack,
+	})
+
+	UI.New(S, "UITextSizeConstraint", logo, {
+		MaxTextSize = 50,
+		MinTextSize = 16,
+	})
+
+	UI.Text(S, content, "ADVANCED INTERFACE // " .. (options.Version or "3.0.0"), {
+		Position = UDim2.fromOffset(12, 98),
+		Size = UDim2.new(1, -24, 0, 30),
+		TextSize = 10,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Font = Enum.Font.Code,
+	}, "Secondary")
+
+	local stages = {
+		"CORE INITIALIZATION",
+		"INTERFACE COMPOSITION",
+		"COMPONENT REGISTRY",
+		"THEME ENGINE",
+		"ANIMATION ENGINE",
+		"HUD LOCK / SYSTEM ONLINE",
+	}
+
+	local labels = {}
+
+	for index, stage in stages do
+		labels[index] = UI.Text(S, content, "○ " .. stage, {
+			Position = UDim2.fromOffset(24, 136 + (index - 1) * 25),
+			Size = UDim2.new(1, -48, 0, 20),
+			TextSize = 10,
+			Font = Enum.Font.Code,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		}, "Secondary")
+	end
+
+	local track = UI.New(S, "Frame", content, {
+		Position = UDim2.new(0, 24, 1, -52),
+		Size = UDim2.new(1, -48, 0, 8),
+	}, {BackgroundColor3 = "Panel2"})
+
+	local fill = UI.New(S, "Frame", track, {
+		Size = UDim2.fromScale(0, 1),
+	}, {BackgroundColor3 = "Accent"})
+
+	UI.Gradient(S, fill, "Accent", "Secondary", 0)
+
+	local percent = UI.Text(S, content, "000%", {
+		Position = UDim2.new(0, 24, 1, -32),
+		Size = UDim2.new(1, -48, 0, 20),
+		TextXAlignment = Enum.TextXAlignment.Right,
+		TextSize = 10,
+		Font = Enum.Font.Code,
+	}, "System")
+
+	Effects:Scale(logo, S, {From = 0.82, Duration = 0.7})
+	Effects:EnergySweep(content, S, {Duration = 1})
+
+	self:Job(S, function(_, now)
+		local alpha = math.clamp((now - started) / duration, 0, 1)
+		local stageIndex = math.clamp(math.ceil(alpha * #stages), 1, #stages)
+
+		fill.Size = UDim2.fromScale(alpha, 1)
+		percent.Text = string.format("%03d%% // BOOT SEQUENCE", math.floor(alpha * 100))
+
+		for index, label in labels do
+			label.Text = (index <= stageIndex and "● " or "○ ") .. stages[index]
+			label.TextTransparency = index <= stageIndex and 0 or 0.55
+		end
+
+		logo.TextTransparency = self:Motion()
+			and math.floor(now * 18) % 31 == 0
+			and 0.25
+			or 0
+	end)
+
+	self:After(duration, function()
+		Effects:Glitch(cover, S, {Duration = 0.22})
+		Effects:Glow(content, S, {Duration = 0.3})
+
+		self:After(0.25, function()
+			S:Destroy()
+
+			Effects:Slide(window.Header, window.Scope, {X = 0, Y = -35, Duration = 0.4})
+
+			if not window.Mobile then
+				Effects:Slide(window.Sidebar, window.Scope, {X = -60, Duration = 0.45})
+			end
+
+			Effects:Scale(window.Content, window.Scope, {From = 0.94, Duration = 0.45})
+			Effects:EnergySweep(window.Shell, window.Scope, {Duration = 0.8})
+
+			if window.CurrentTab then
+				window:SelectTab(window.CurrentTab)
+			end
+
+			self:Notify({
+				Title = "SYSTEM ONLINE",
+				Description = "Command center ready. Operator controls unlocked.",
+				Type = "Success",
+				Duration = 4,
+			})
+		end, S)
+	end, S)
+end
+
+function Library:PlayEffect(name, options)
+	assert(self.Window, "CreateWindow first")
+
+	if name == "SystemBoot" then
+		return self:Boot(options)
+	end
+
+	return Effects:Play(name, self.Window.Shell, self.Window.Scope, options)
+end
+
+---------------------------------------------------------------------
+-- CONFIGURATION
+---------------------------------------------------------------------
+
+function Library:ExportConfig()
+	local values = {}
+
+	for id, control in self.Registry do
+		local value = control.Value
+
+		if typeof(value) == "Color3" then
+			values[id] = {
+				Type = "Color3",
+				R = value.R,
+				G = value.G,
+				B = value.B,
+			}
+		else
+			values[id] = value
+		end
+	end
+
+	return HttpService:JSONEncode({
+		Schema = 1,
+		Theme = self.ThemeName,
+		Values = values,
+	})
+end
+
+function Library:ImportConfig(json, fireCallbacks)
+	assert(type(json) == "string" and #json <= 100000, "Invalid config payload")
+
+	local data = HttpService:JSONDecode(json)
+
+	assert(type(data) == "table" and data.Schema == 1, "Unsupported schema")
+	assert(type(data.Values) == "table", "Missing control values")
+	assert(type(data.Theme) == "string" and Themes[data.Theme], "Unknown theme")
+
+	local staged = {}
+
+	for id, value in data.Values do
+		local control = self.Registry[id]
+
+		if control then
+			if type(value) == "table" and value.Type == "Color3" then
+				for _, channel in {"R", "G", "B"} do
+					assert(
+						finite(value[channel])
+							and value[channel] >= 0
+							and value[channel] <= 1,
+						"Invalid color channel"
+					)
+				end
+
+				value = Color3.new(value.R, value.G, value.B)
+			end
+
+			table.insert(staged, {
+				Control = control,
+				Value = control:Validate(value),
+			})
+		end
+	end
+
+	-- Validate first, then apply recognized values.
+	self:SetTheme(data.Theme)
+
+	for _, entry in staged do
+		entry.Control:Set(entry.Value, true)
+	end
+
+	-- Explicit opt-in: arbitrary callbacks can perform gameplay actions.
+	if fireCallbacks then
+		for _, entry in staged do
+			self:Call(entry.Control.Callback, entry.Value)
+		end
+	end
+
+	return true
+end
+
+---------------------------------------------------------------------
+-- SETTINGS CONTROL CENTER
+---------------------------------------------------------------------
+
+function Library:CreateSettings()
+	local tab = self.Window:CreateTab({
+		Name = "Settings",
+		Icon = "CFG",
+		Description = "INTERFACE CONTROL CENTER",
+		Accent = "Settings",
+	})
+
+	tab:CreateSection("INTERFACE / DISPLAY")
+
+	local scaleControl = tab:CreateDropdown({
+		Name = "UI Scale",
+		Values = {"75%", "80%", "90%", "100%", "110%", "125%", "150%"},
+		Default = "100%",
+		Callback = function(value)
+			self:SetOption("UIScale", tonumber(string.match(value, "%d+")) / 100)
+		end,
+	})
+
+	local transparencyControl = tab:CreateSlider({
+		Name = "Glass Transparency",
+		Min = 0,
+		Max = 0.65,
+		Step = 0.01,
+		Default = self.Options.Transparency,
+		Percentage = true,
+		Callback = function(value)
+			self:SetOption("Transparency", value)
+		end,
+	})
+
+	tab:CreateSection("ANIMATION / EFFECTS / PERFORMANCE")
+
+	local optionControls = {}
+
+	for _, option in {
+		"Animated",
+		"Effects",
+		"Particles",
+		"Glow",
+		"ReducedMotion",
+		"PerformanceMode",
+		"TerminalTyping",
+	} do
+		local name = option
+
+		optionControls[name] = tab:CreateToggle({
+			Name = name,
+			Default = self.Options[name],
+			Callback = function(value)
+				self:SetOption(name, value)
+			end,
+		})
+	end
+
+	local countControl = tab:CreateSlider({
+		Name = "Maximum Particles",
+		Description = "Allocated pool: up to 72 particles per main background.",
+		Min = 0,
+		Max = 72,
+		Step = 1,
+		Default = self.Options.MaxParticles,
+		Callback = function(value)
+			self:SetOption("MaxParticles", value)
+		end,
+	})
+
+	tab:CreateSection("THEME ENGINE")
+
+	local themeControl = tab:CreateDropdown({
+		Name = "Theme",
+		Values = ThemeNames,
+		Default = self.ThemeName,
+		Callback = function(value)
+			self:SetTheme(value)
+		end,
+	})
+
+	local accentControl = tab:CreateColorPicker({
+		Name = "Accent Override",
+		Default = self.Palette.Accent,
+		Callback = function(value)
+			self:SetOption("Accent", value)
+		end,
+	})
+
+	tab:CreateButton({
+		Name = "Reset Theme Accent",
+		Description = "Remove the custom accent override.",
+		Callback = function()
+			self.Options.Accent = nil
+			self:SetTheme(self.ThemeName)
+		end,
+	})
+
+	-- Keep runtime settings and displayed controls synchronized.
+	self:Watch(tab.Scope, function()
+		for name, control in optionControls do
+			if control.Value ~= self.Options[name] then
+				control:Set(self.Options[name], true)
+			end
+		end
+
+		if themeControl.Value ~= self.ThemeName then
+			themeControl:Set(self.ThemeName, true)
+		end
+
+		if accentControl.Value ~= self.Palette.Accent then
+			accentControl:Set(self.Palette.Accent, true)
+		end
+
+		if transparencyControl.Value ~= self.Options.Transparency then
+			transparencyControl:Set(self.Options.Transparency, true)
+		end
+
+		if countControl.Value ~= self.Options.MaxParticles then
+			countControl:Set(self.Options.MaxParticles, true)
+		end
+
+		local percent = tostring(math.round(self.Options.UIScale * 100)) .. "%"
+
+		if table.find({"75%", "80%", "90%", "100%", "110%", "125%", "150%"}, percent)
+			and scaleControl.Value ~= percent
+		then
+			scaleControl:Set(percent, true)
+		end
+	end)
+
+	tab:CreateSection("CONTROLS")
+
+	tab:CreateKeybind({
+		Name = "Toggle Interface",
+		Default = "RightShift",
+		OnPressed = function()
+			self.Window:Toggle()
+		end,
+	})
+
+	tab:CreateSection("CONFIGURATION")
+
+	tab:CreateButton({
+		Name = "Export Configuration",
+		Description = "Exports controls with an explicit Id. Session-local JSON.",
+		Callback = function()
+			self.Window:TextDialog(
+				"EXPORT CONFIG // JSON",
+				self:ExportConfig(),
+				true
+			)
+		end,
+	})
+
+	tab:CreateButton({
+		Name = "Import Configuration",
+		Description = "Restores values without running feature callbacks.",
+		Callback = function()
+			self.Window:TextDialog("IMPORT CONFIG // JSON", "", false, function(text)
+				local ok, err = pcall(function()
+					self:ImportConfig(text, false)
+				end)
+
+				self:Notify({
+					Title = ok and "CONFIGURATION LOADED" or "CONFIGURATION ERROR",
+					Description = ok
+						and "Values restored. Feature callbacks were not executed."
+						or tostring(err),
+					Type = ok and "Success" or "Error",
+				})
+			end)
+		end,
+	})
+
+	return tab
+end
+
+---------------------------------------------------------------------
+-- DESTROY
+---------------------------------------------------------------------
+
+function Library:Destroy()
+	if not self.Scope.Alive then
+		return
+	end
+
+	self:StopDrag()
+	self.KeyCapture = nil
+	self.Scope:Destroy()
+
+	table.clear(self.Jobs)
+	table.clear(self.Bindings)
+	table.clear(self.Watchers)
+	table.clear(self.Registry)
+	table.clear(self.Keybinds)
+	table.clear(self.TweenSlots)
+
+	self.Window = nil
+end
+
+function WindowClass:Destroy()
+	Library:Destroy()
+end
+
+---------------------------------------------------------------------
+-- DEMO
+-- Edit this section to connect NOVA to your own game systems.
+---------------------------------------------------------------------
+
+local Window = Library:CreateWindow({
+	Title = "N O V A",
+	Subtitle = "ADVANCED EXECUTION INTERFACE",
+	Version = "3.0.0",
+	Theme = "NeonPurple",
+
+	Animated = true,
+	Effects = true,
+	Particles = true,
+	Glow = true,
+
+	MaxParticles = 36,
+	ParticleLifetime = 12,
+	ParticleSpeed = 0.035,
+	ParticleOpacity = 0.55,
+
+	-- Optional hook. Play a Sound owned by your experience here.
+	HoverSound = function(_button)
+		-- YourSound:Play()
+	end,
+})
+
+local Dashboard = Window:CreateTab({
+	Name = "Dashboard",
+	Icon = "HOME",
+	Description = "SYSTEM OVERVIEW",
+	Accent = "System",
+})
+
+local Main = Window:CreateTab({
+	Name = "Main",
+	Icon = "CORE",
+	Description = "OPERATION CONTROLS",
+	Accent = "Executor",
+})
+
+local Visual = Window:CreateTab({
+	Name = "Visual",
+	Icon = "FX",
+	Description = "HOLOGRAPHIC SYSTEMS",
+	Accent = "Secondary",
+})
+
+local Console, ConsoleTab = Window:CreateConsole({
+	Name = "Console",
+	Icon = ">_",
+	Description = "LIVE DEVELOPER TERMINAL",
+	Accent = "Console",
+})
+
+Library:CreateSettings()
+
+local running = false
+local runId = 0
+local completedRuns = 0
+local systemCards
+
+local function runDemo()
+	if not Library.Scope.Alive then
+		return
+	end
+
+	if Window.Booting then
+		return
+	end
+
+	if running then
+		Library:Notify({
+			Title = "OPERATION IN PROGRESS",
+			Description = "Wait for the current local demo operation.",
+			Type = "Warning",
+			Duration = 3,
+		})
+		return
+	end
+
+	running = true
+	runId += 1
+
+	local thisRun = runId
+	local checksum = 0
+
+	Library:SetStatus(
+		"INITIALIZING",
+		"Creating local demonstration workspace...",
+		0
+	)
+
+	Library:PlayEffect("EnergyBurst")
+
+	Console:Log(
+		"DEBUG",
+		"Execution uses fixed local functions, not source-text evaluation."
+	)
+
+	for stage = 1, 12 do
+		local stageIndex = stage
+
+		Library:After(stageIndex * 0.32, function()
+			if thisRun ~= runId then
+				return
+			end
+
+			-- Small, real local computation.
+			local samples = table.create(192)
+
+			for index = 1, 192 do
+				samples[index] = math.sin(index * stageIndex * 0.017)
+			end
+
+			table.sort(samples)
+
+			for _, sample in samples do
+				checksum += sample
+			end
+
+			local state = stageIndex <= 2 and "LOADING"
+				or stageIndex <= 8 and "PROCESSING"
+				or stageIndex <= 10 and "EXECUTING"
+				or "FINALIZING"
+
+			Library:SetStatus(
+				state,
+				string.format(
+					"MODULE %02d / 12 // sorted 192 local samples",
+					stageIndex
+				),
+				stageIndex / 12
+			)
+
+			if systemCards then
+				systemCards:Set(4, string.format("%02d / 12", stageIndex))
+			end
+
+			if stageIndex == 12 then
+				running = false
+				completedRuns += 1
+
+				Library:SetStatus(
+					"COMPLETED",
+					string.format("Local pipeline complete. Checksum %.4f", checksum),
+					1
+				)
+
+				Console:Log(
+					"SUCCESS",
+					string.format("Run #%d completed.", completedRuns)
+				)
+
+				Library:Notify({
+					Title = "EXECUTION COMPLETED",
+					Description = string.format(
+						"12 local stages completed. Checksum: %.4f",
+						checksum
+					),
+					Type = "Success",
+					Duration = 5,
+				})
+
+				Library:PlayEffect("EnergyBurst")
+			end
+		end)
+	end
+end
+
+Dashboard:CreateHero({
+	Title = "Welcome back,\nOperator.",
+	Description = "LOCAL SYSTEM READY // COMMAND AUTHORITY ACTIVE",
+	OnExecute = runDemo,
+	OnConsole = function()
+		Window:SelectTab(ConsoleTab)
+	end,
+})
+
+Dashboard:CreateSection("SYSTEM / MODULE OVERVIEW")
+
+systemCards = Dashboard:CreateStats({
+	{
+		Name = "System",
+		Value = "ONLINE",
+		Description = "CLIENT INTERFACE READY",
+		Accent = "System",
+	},
+	{
+		Name = "Status",
+		Value = "NOMINAL",
+		Description = "CONTROL REGISTRY ACTIVE",
+		Accent = "Success",
+	},
+	{
+		Name = "Performance",
+		Value = "ADAPTIVE",
+		Description = "30 Hz FX / 10 Hz ECO",
+		Accent = "Secondary",
+	},
+	{
+		Name = "Execution",
+		Value = "00 / 12",
+		Description = "LOCAL DEMO PIPELINE",
+		Accent = "Executor",
+	},
+	{
+		Name = "Network",
+		Value = "LOCAL",
+		Description = "NO NETWORK REQUESTS",
+		Accent = "Console",
+	},
+	{
+		Name = "Version",
+		Value = "3.0.0",
+		Description = "SINGLE-FILE EDITION",
+		Accent = "Settings",
+	},
+})
+
+Dashboard:CreateMonitor()
+
+Dashboard:CreateSection("QUICK COMMANDS")
+
+Dashboard:CreateButton({
+	Name = "Open Command Palette",
+	Description = "Keyboard shortcut: Ctrl + K",
+	Icon = "SEARCH",
+	Callback = function()
+		Window:OpenCommands()
+	end,
+})
+
+Main:CreateSection("OPERATION CONTROL")
+
+Main:CreateButton({
+	Name = "Execute Local Demo",
+	Description = "Run twelve stages of local data processing.",
+	Icon = "PLAY",
+	Accent = "Executor",
+	Callback = runDemo,
+})
+
+Main:CreateToggle({
+	Id = "demo_feature",
+	Name = "Feature Power",
+	Description = "Demonstration switch. Does not modify gameplay.",
+	Default = false,
+	Callback = function(value)
+		Console:Log("INFO", "Feature Power = " .. tostring(value))
+
+		Library:Notify({
+			Title = value and "FEATURE ACTIVE" or "FEATURE STANDBY",
+			Description = "Demonstration control state changed.",
+			Type = value and "Success" or "System",
+			Duration = 2.5,
+		})
+	end,
+})
+
+Main:CreateSlider({
+	Id = "power",
+	Name = "Power",
+	Description = "Mouse / touch drag, neon track and tick marks.",
+	Min = 0,
+	Max = 1000,
+	Default = 342,
+	Step = 1,
+	Percentage = true,
+	Callback = function(_value)
+		-- Connect an authorized game feature here.
+	end,
+})
+
+Main:CreateInput({
+	Id = "speed",
+	Name = "Speed",
+	Description = "Numeric validation with decimal +/- steps.",
+	Numeric = true,
+	Min = 0,
+	Max = 500,
+	Step = 0.25,
+	Default = 120,
+	Callback = function(value)
+		Console:Log("DEBUG", "Speed control = " .. tostring(value))
+	end,
+})
+
+Main:CreateInput({
+	Id = "operator",
+	Name = "Operator Alias",
+	Description = "Plain text only; never evaluated as code.",
+	Default = "Operator",
+	MaxLength = 40,
+	Callback = function(value)
+		Console:Log("INFO", "Operator alias: " .. value)
+	end,
+})
+
+Main:CreateDropdown({
+	Id = "mode",
+	Name = "Processing Mode",
+	Description = "Searchable floating holographic selector.",
+	Values = {"NORMAL", "FAST", "EXTREME", "CUSTOM"},
+	Default = "NORMAL",
+	Callback = function(value)
+		Console:Log("INFO", "Mode selected: " .. value)
+	end,
+})
+
+Main:CreateKeybind({
+	Id = "execute_key",
+	Name = "Execute Shortcut",
+	Description = "Keyboard shortcut for the local demo.",
+	Default = "F6",
+	OnPressed = runDemo,
+})
+
+Visual:CreateSection("HOLOGRAPHIC EFFECT LAB")
+
+Visual:CreateColorPicker({
+	Id = "signal_color",
+	Name = "Signal Color",
+	Description = "HSV control; updates the interface accent.",
+	Default = Library.Palette.Accent,
+	Callback = function(color)
+		Library:SetOption("Accent", color)
+	end,
+})
+
+for _, effect in {
+	"Glow",
+	"Pulse",
+	"Ripple",
+	"Shimmer",
+	"Scanline",
+	"ParticleBurst",
+	"EnergySweep",
+	"EnergyBurst",
+	"Glitch",
+} do
+	local effectName = effect
+
+	Visual:CreateButton({
+		Name = effectName,
+		Description = "Scoped visual effect with automatic cleanup.",
+		Accent = "Secondary",
+		Callback = function()
+			Library:PlayEffect(effectName)
+		end,
+	})
+end
+
+Visual:CreateSection("SYSTEM ALERT LAB")
+
+for _, kind in {"System", "Success", "Warning", "Error"} do
+	local alertType = kind
+
+	Visual:CreateButton({
+		Name = alertType .. " Alert",
+		Description = "Preview alert styling, stacking and timeout.",
+		Callback = function()
+			Library:Notify({
+				Title = string.upper(alertType) .. " // DEMONSTRATION",
+				Description = "Visual alert preview, not a real system failure.",
+				Type = alertType,
+				Duration = 4,
+			})
+		end,
+	})
+end
+
+Visual:CreateButton({
+	Name = "Replay Cinematic Boot",
+	Description = "Replays presentation without recreating the library.",
+	Callback = function()
+		Library:Boot({
+			Logo = "N O V A",
+			Version = "3.0.0",
+			Duration = 3,
+		})
+	end,
+})
+
+Window:AddCommand("Execute Local Demo", runDemo)
+
+Window:AddCommand("Change Theme", function()
+	local items = {}
+
+	for _, name in ThemeNames do
+		table.insert(items, {Name = name})
+	end
+
+	Window:OpenPicker("THEME ENGINE", items, function(item)
+		Library:SetTheme(item.Name)
+	end)
+end)
+
+Window:AddCommand("Toggle Performance Mode", function()
+	Library:SetPerformanceMode(not Library.Options.PerformanceMode)
+
+	Library:Notify({
+		Title = "PERFORMANCE MODE",
+		Description = Library.Options.PerformanceMode
+			and "Enabled: reduced effects and 10 Hz scheduler."
+			or "Disabled: cinematic effects restored.",
+		Type = "System",
+	})
+end)
+
+Window:AddCommand("Toggle Reduced Motion", function()
+	Library:SetOption("ReducedMotion", not Library.Options.ReducedMotion)
+end)
+
+Window:AddCommand("Replay System Boot", function()
+	Library:PlayEffect("SystemBoot", {
+		Logo = "N O V A",
+		Duration = 3,
+	})
+end)
+
+Window:AddCommand("Show System Alert", function()
+	Library:Notify({
+		Title = "COMMAND ACCEPTED",
+		Description = "Command palette connected to the live interface.",
+		Type = "Success",
+	})
+end)
+
+Console:Log("INFO", "Theme engine: seven palettes registered.")
+Console:Log("INFO", "Input router: mouse / touch / keyboard.")
+Console:Log("INFO", "Ctrl+K: commands. RightShift: toggle. F6: local demo.")
+Console:Log("DEBUG", "Card signal bars are decorative. Header FPS/MEM use runtime data.")
+Console:Log("WARNING", "Config is session-local JSON; no server persistence is connected.")
+
+Window:SelectTab(Dashboard)
+
+Library:Boot({
+	Logo = "N O V A",
+	Version = "3.0.0",
+	Duration = 3.2,
+})
+
+Library:After(4.1, runDemo)
+
+---------------------------------------------------------------------
+-- YOUR CUSTOM CODE CAN GO BELOW
+---------------------------------------------------------------------
+
+-- Examples:
+--
+-- Library:SetTheme("CyberBlue")
+-- Library:SetPerformanceMode(true)
+-- Library:SetOption("ReducedMotion", true)
+--
+-- Library:SetStatus("EXECUTING", "Processing task...", 0.5)
+-- Library:SetProgress(0.75, "Almost finished...")
+--
+-- Library:Notify({
+--     Title = "SYSTEM ONLINE",
+--     Description = "All systems operational.",
+--     Type = "Success",
+--     Duration = 4,
+-- })
+--
+-- local CustomTab = Window:CreateTab({
+--     Name = "Custom",
+--     Icon = "APP",
+-- })
+--
+-- CustomTab:CreateButton({
+--     Name = "My Command",
+--     Callback = function()
+--         print("Command executed")
+--     end,
+-- })
+--
+-- Full cleanup:
+-- Library:Destroy()
